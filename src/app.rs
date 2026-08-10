@@ -191,13 +191,13 @@ impl RoWheelApp {
 
                 if let Some(ref look_back) = config.look_back {
                     if let Some(pressed) = state.get_button(&look_back.device_id, look_back.button_code) {
-                        xbox_state.buttons.right_bumper = pressed;
+                        xbox_state.buttons.b = pressed;
                     }
                 }
 
                 if let Some(ref gear_mode) = config.gear_mode {
                     if let Some(pressed) = state.get_button(&gear_mode.device_id, gear_mode.button_code) {
-                        xbox_state.buttons.start = pressed;
+                        xbox_state.buttons.dpad_up = pressed;
                     }
                 }
 

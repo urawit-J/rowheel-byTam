@@ -15,11 +15,14 @@ pub enum CalibrationStep {
     ClutchReleased,
     ShiftUp,
     ShiftDown,
+    ViewChange,
+    LookBack,
+    GearMode,
     Complete,
 }
 
 impl CalibrationStep {
-    pub const TOTAL_STEPS: usize = 12;
+    pub const TOTAL_STEPS: usize = 15;
 
     pub fn index(&self) -> usize {
         match self {
@@ -34,7 +37,10 @@ impl CalibrationStep {
             Self::ClutchReleased => 8,
             Self::ShiftUp => 9,
             Self::ShiftDown => 10,
-            Self::Complete => 11,
+            Self::ViewChange => 11,
+            Self::LookBack => 12,
+            Self::GearMode => 13,
+            Self::Complete => 14,
         }
     }
 
@@ -51,6 +57,9 @@ impl CalibrationStep {
             Self::ClutchReleased => "Release the CLUTCH pedal completely, then continue",
             Self::ShiftUp => "Press the SHIFT UP button/paddle, then continue",
             Self::ShiftDown => "Press the SHIFT DOWN button/paddle, then continue",
+            Self::ViewChange => "Press the VIEW CHANGE button (e.g. Circle), then continue",
+            Self::LookBack => "Press the LOOK BACK button (e.g. Square), then continue",
+            Self::GearMode => "Press the GEAR MODE button (e.g. Cross), then continue",
             Self::Complete => "Successfully calibrated",
         }
     }
@@ -71,7 +80,10 @@ impl CalibrationStep {
             Self::ClutchPressed => Self::ClutchReleased,
             Self::ClutchReleased => Self::ShiftUp,
             Self::ShiftUp => Self::ShiftDown,
-            Self::ShiftDown => Self::Complete,
+            Self::ShiftDown => Self::ViewChange,
+            Self::ViewChange => Self::LookBack,
+            Self::LookBack => Self::GearMode,
+            Self::GearMode => Self::Complete,
             Self::Complete => Self::Complete,
         }
     }
@@ -291,6 +303,33 @@ impl CalibrationWizard {
                     });
                 }
             }
+            CalibrationStep::ViewChange => {
+                if let Some((device_id, device_name, button_code)) = self.captured_button.take() {
+                    self.config.view_change = Some(ButtonBinding {
+                        device_id,
+                        device_name,
+                        button_code,
+                    });
+                }
+            }
+            CalibrationStep::LookBack => {
+                if let Some((device_id, device_name, button_code)) = self.captured_button.take() {
+                    self.config.look_back = Some(ButtonBinding {
+                        device_id,
+                        device_name,
+                        button_code,
+                    });
+                }
+            }
+            CalibrationStep::GearMode => {
+                if let Some((device_id, device_name, button_code)) = self.captured_button.take() {
+                    self.config.gear_mode = Some(ButtonBinding {
+                        device_id,
+                        device_name,
+                        button_code,
+                    });
+                }
+            }
             CalibrationStep::Complete => {
                 if let Err(e) = self.config.save() {
                     log::error!("Failed to save config: {}", e);
@@ -353,7 +392,11 @@ impl CalibrationWizard {
     pub fn needs_button_detection(&self) -> bool {
         matches!(
             self.step,
-            CalibrationStep::ShiftUp | CalibrationStep::ShiftDown
+            CalibrationStep::ShiftUp
+                | CalibrationStep::ShiftDown
+                | CalibrationStep::ViewChange
+                | CalibrationStep::LookBack
+                | CalibrationStep::GearMode
         )
     }
 }

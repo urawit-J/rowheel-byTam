@@ -183,6 +183,24 @@ impl RoWheelApp {
                     }
                 }
 
+                if let Some(ref view_change) = config.view_change {
+                    if let Some(pressed) = state.get_button(&view_change.device_id, view_change.button_code) {
+                        xbox_state.buttons.back = pressed;
+                    }
+                }
+
+                if let Some(ref look_back) = config.look_back {
+                    if let Some(pressed) = state.get_button(&look_back.device_id, look_back.button_code) {
+                        xbox_state.buttons.right_bumper = pressed;
+                    }
+                }
+
+                if let Some(ref gear_mode) = config.gear_mode {
+                    if let Some(pressed) = state.get_button(&gear_mode.device_id, gear_mode.button_code) {
+                        xbox_state.buttons.start = pressed;
+                    }
+                }
+
                 self.current_state = xbox_state.clone();
 
                 if let Some(ref mut vc) = self.virtual_controller {
@@ -227,6 +245,9 @@ impl RoWheelApp {
                         CalibrationStep::ClutchPressed | CalibrationStep::ClutchReleased => "Clutch",
                         CalibrationStep::ShiftUp => "Shift Up",
                         CalibrationStep::ShiftDown => "Shift Down",
+                        CalibrationStep::ViewChange => "View Change",
+                        CalibrationStep::LookBack => "Look Back",
+                        CalibrationStep::GearMode => "Gear Mode",
                         CalibrationStep::Complete => "Complete",
                     };
                     ui.label(egui::RichText::new(step_name).size(24.0).strong());

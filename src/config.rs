@@ -66,6 +66,9 @@ pub struct WheelConfig {
     pub clutch: Option<AxisBinding>,
     pub shift_up: Option<ButtonBinding>,
     pub shift_down: Option<ButtonBinding>,
+    pub view_change: Option<ButtonBinding>,
+    pub look_back: Option<ButtonBinding>,
+    pub gear_mode: Option<ButtonBinding>,
     pub force_feedback_device: Option<String>,
 }
 

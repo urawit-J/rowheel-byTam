@@ -3,6 +3,12 @@ name: Build Windows Release
 on:
   release:
     types: [created]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (e.g. v1.0.1)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -24,4 +30,5 @@ jobs:
       - name: Upload Windows executable to release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag || github.event.release.tag_name }}
           files: target/release/rowheel.exe

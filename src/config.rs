@@ -3,6 +3,10 @@ use std::path::PathBuf;
 
 const CONFIG_FILENAME: &str = "rowheel_config.json";
 
+/// Current `WheelConfig::schema`. A file written before schema 1 bound L2 to
+/// the parking aid; the mirror camera owns that button now.
+const CONFIG_SCHEMA: u32 = 1;
+
 /// Gear index space, matching the mka GXZ truck's `Tune.Ratios`:
 /// -1 = reverse, 0 = neutral, 1..=7 = forward gears.
 pub const GEAR_REVERSE: i8 = -1;
@@ -27,6 +31,16 @@ pub const GEAR_MAX: i8 = 7;
 pub const GEAR_AXIS_STEP: f32 = 0.1;
 /// Slot number of gear 0 (neutral); reverse is one slot below it.
 pub const GEAR_AXIS_BASE: i8 = 3;
+
+/// Nudge applied to the gear axis so a change event keeps landing.
+///
+/// Roblox will not report this axis on request -- the game logged
+/// `GetGamepadState` reading it as 0.000 while change events carried the real
+/// value -- so a lever that has not moved since the driver sat down would stay
+/// unknown, and the switch-to-Manual sync had nothing to sync to. Alternating by
+/// well under half a step keeps the decoded gate identical while guaranteeing a
+/// fresh event.
+pub const GEAR_AXIS_DITHER: f32 = 0.02;
 
 /// Encode a gear index as `right_stick_x`.
 pub fn encode_gear(gear: i8) -> f32 {
@@ -79,13 +93,59 @@ impl AxisBinding {
     }
 }
 
+/// How far a hat has to sit before it counts as held. A POV hat rests at 0 and
+/// snaps to +/-1, so anything in between is the gap between detents.
+pub const HAT_THRESHOLD: f32 = 0.5;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ButtonBinding {
     /// Stable per-device key, same scheme as `AxisBinding::device_id`.
     pub device_id: String,
     pub device_name: String,
+    /// Button code, or -- when `axis_direction` is set -- an axis code.
     pub button_code: u32,
+    /// Set when this control is one direction of a POV hat rather than a button.
+    ///
+    /// A wheel's D-pad is a hat: it arrives as an axis, not as four buttons, so
+    /// plain button capture never sees it. Recording the sign lets one axis
+    /// serve as two controls.
+    #[serde(default)]
+    pub axis_direction: Option<i8>,
 }
+
+impl ButtonBinding {
+    /// Whether the driver is holding this control right now.
+    pub fn is_pressed(&self, state: &crate::input::InputState) -> bool {
+        match self.axis_direction {
+            Some(direction) => state
+                .get_axis(&self.device_id, self.button_code)
+                .map(|value| {
+                    if direction < 0 {
+                        value <= -HAT_THRESHOLD
+                    } else {
+                        value >= HAT_THRESHOLD
+                    }
+                })
+                .unwrap_or(false),
+            None => state
+                .get_button(&self.device_id, self.button_code)
+                .unwrap_or(false),
+        }
+    }
+
+    /// How this control reads in the UI.
+    pub fn describe(&self) -> String {
+        match self.axis_direction {
+            Some(direction) => format!(
+                "axis {} {}",
+                self.button_code,
+                if direction < 0 { "-" } else { "+" }
+            ),
+            None => format!("button {}", self.button_code),
+        }
+    }
+}
+
 
 /// One slot of an H-pattern shifter. The Moza HGP reports every gate position
 /// as its own HID button, so each gear gets a plain `ButtonBinding`.
@@ -107,6 +167,10 @@ fn default_clutch_release() -> f32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WheelConfig {
+    /// Bumped whenever a field changes meaning, so `load` can migrate an older
+    /// file instead of making the driver calibrate everything again.
+    #[serde(default)]
+    pub schema: u32,
     pub steering: Option<AxisBinding>,
     pub throttle: Option<AxisBinding>,
     pub brake: Option<AxisBinding>,
@@ -131,7 +195,17 @@ pub struct WheelConfig {
     /// Recovery / return to checkpoint (game key `R`).
     #[serde(default)]
     pub recovery: Option<ButtonBinding>,
-    /// Parking aid overlay (game key `T`).
+    /// Mirror camera (wheel L2).
+    #[serde(default)]
+    pub mirror_camera: Option<ButtonBinding>,
+    /// Booth menu confirm / next (wheel cross).
+    #[serde(default)]
+    pub menu_confirm: Option<ButtonBinding>,
+    /// Booth menu cancel / back (wheel circle).
+    #[serde(default)]
+    pub menu_cancel: Option<ButtonBinding>,
+    /// Parking aid overlay, game key `T` (wheel triangle). It used to be L2,
+    /// until the mirror camera claimed that button.
     #[serde(default)]
     pub parking_aid: Option<ButtonBinding>,
     /// Transmission mode toggle (game key `M`).
@@ -142,6 +216,7 @@ pub struct WheelConfig {
 impl Default for WheelConfig {
     fn default() -> Self {
         Self {
+            schema: CONFIG_SCHEMA,
             steering: None,
             throttle: None,
             brake: None,
@@ -153,6 +228,9 @@ impl Default for WheelConfig {
             gears: Vec::new(),
             camera: None,
             recovery: None,
+            mirror_camera: None,
+            menu_confirm: None,
+            menu_cancel: None,
             parking_aid: None,
             gear_mode: None,
             force_feedback_device: None,
@@ -165,8 +243,9 @@ impl WheelConfig {
         let path = Self::config_path();
         if path.exists() {
             match std::fs::read_to_string(&path) {
-                Ok(contents) => match serde_json::from_str(&contents) {
-                    Ok(config) => {
+                Ok(contents) => match serde_json::from_str::<Self>(&contents) {
+                    Ok(mut config) => {
+                        config.migrate();
                         log::info!("Loaded config from {:?}", path);
                         return Some(config);
                     }
@@ -180,6 +259,22 @@ impl WheelConfig {
             }
         }
         None
+    }
+
+    /// Bring an older file up to the current schema.
+    ///
+    /// Before schema 1 the wheel's L2 was the parking aid. The mirror camera
+    /// took that button, so an old `parking_aid` binding is what L2 is bound to
+    /// and belongs on `mirror_camera`; only the new triangle button is left to
+    /// calibrate.
+    fn migrate(&mut self) {
+        if self.schema < 1 {
+            if self.mirror_camera.is_none() {
+                self.mirror_camera = self.parking_aid.take();
+            }
+            log::info!("Migrated config to schema 1: L2 moved from parking aid to mirror camera");
+        }
+        self.schema = CONFIG_SCHEMA;
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
@@ -217,5 +312,52 @@ impl WheelConfig {
     /// Forget one gate, for a shifter that does not have it.
     pub fn clear_gear(&mut self, gear: i8) {
         self.gears.retain(|g| g.gear != gear);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn button(code: u32) -> ButtonBinding {
+        ButtonBinding {
+            device_id: "wheel".to_string(),
+            device_name: "wheel".to_string(),
+            button_code: code,
+            axis_direction: None,
+        }
+    }
+
+    /// A config written before the mirror camera existed has L2 recorded as the
+    /// parking aid. Moving it is what saves the driver a full recalibration, so
+    /// it has to survive a round trip through the file format.
+    #[test]
+    fn an_old_config_moves_l2_from_parking_aid_to_the_mirror() {
+        let old = r#"{ "steering": null, "throttle": null, "brake": null, "clutch": null,
+            "shift_up": null, "shift_down": null, "gear_mode": null,
+            "force_feedback_device": null,
+            "parking_aid": { "device_id": "wheel", "device_name": "wheel", "button_code": 7 } }"#;
+
+        let mut config: WheelConfig = serde_json::from_str(old).expect("old config parses");
+        assert_eq!(config.schema, 0, "a file with no schema reads as 0");
+        config.migrate();
+
+        assert_eq!(config.mirror_camera.map(|b| b.button_code), Some(7));
+        assert!(config.parking_aid.is_none(), "the triangle button is still to be calibrated");
+        assert_eq!(config.schema, CONFIG_SCHEMA);
+    }
+
+    /// Migration must not fire twice and steal a freshly-bound triangle button.
+    #[test]
+    fn a_current_config_is_left_alone() {
+        let mut config = WheelConfig {
+            mirror_camera: Some(button(7)),
+            parking_aid: Some(button(3)),
+            ..Default::default()
+        };
+        config.migrate();
+
+        assert_eq!(config.mirror_camera.map(|b| b.button_code), Some(7));
+        assert_eq!(config.parking_aid.map(|b| b.button_code), Some(3));
     }
 }

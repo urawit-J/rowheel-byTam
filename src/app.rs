@@ -37,6 +37,10 @@ pub struct RoWheelApp {
     clutch_travel: f32,
     /// Last gate position decoded from the H-shifter, for the debug panel.
     current_gear: i8,
+    /// Alternated so the gear axis keeps producing change events; see
+    /// `GEAR_AXIS_DITHER`.
+    gear_dither: bool,
+    gear_dither_at: std::time::Instant,
 }
 
 impl RoWheelApp {
@@ -88,6 +92,8 @@ impl RoWheelApp {
             clutch_engaged: false,
             clutch_travel: 0.0,
             current_gear: crate::config::GEAR_NEUTRAL,
+            gear_dither: false,
+            gear_dither_at: std::time::Instant::now(),
         }
     }
 
@@ -223,16 +229,17 @@ impl RoWheelApp {
                 // BoothInput.Next, which a held clutch would jam.
                 xbox_state.buttons.right_thumb = self.clutch_engaged;
 
+                // The paddles do double duty: ContlrShiftUp/ContlrShiftDown
+                // while driving, BoothInput.Next/Previous in the booth menu.
+                // The wheel D-pad cannot walk the menu -- the adapter reads it
+                // as a POV hat and never sees its RIGHT direction -- and Drive
+                // stands down while a menu owns input, so the two never clash.
                 if let Some(ref shift_up) = config.shift_up {
-                    if let Some(pressed) = state.get_button(&shift_up.device_id, shift_up.button_code) {
-                        xbox_state.buttons.y = pressed;
-                    }
+                    xbox_state.buttons.y = shift_up.is_pressed(state);
                 }
 
                 if let Some(ref shift_down) = config.shift_down {
-                    if let Some(pressed) = state.get_button(&shift_down.device_id, shift_down.button_code) {
-                        xbox_state.buttons.x = pressed;
-                    }
+                    xbox_state.buttons.x = shift_down.is_pressed(state);
                 }
 
                 // H-pattern gear. The HGP reports every gate position as its own
@@ -247,40 +254,56 @@ impl RoWheelApp {
                     let gear = config
                         .gears
                         .iter()
-                        .find(|b| {
-                            state
-                                .get_button(&b.button.device_id, b.button.button_code)
-                                .unwrap_or(false)
-                        })
+                        .find(|b| b.button.is_pressed(state))
                         .map(|b| b.gear)
                         .unwrap_or(crate::config::GEAR_NEUTRAL);
 
                     self.current_gear = gear;
-                    xbox_state.right_stick_x = crate::config::encode_gear(gear);
+                    if self.gear_dither_at.elapsed() >= std::time::Duration::from_millis(500) {
+                        self.gear_dither_at = std::time::Instant::now();
+                        self.gear_dither = !self.gear_dither;
+                    }
+                    let dither = if self.gear_dither {
+                        crate::config::GEAR_AXIS_DITHER
+                    } else {
+                        0.0
+                    };
+                    xbox_state.right_stick_x = crate::config::encode_gear(gear) + dither;
                 }
 
                 if let Some(ref camera) = config.camera {
-                    if let Some(pressed) = state.get_button(&camera.device_id, camera.button_code) {
-                        xbox_state.buttons.dpad_down = pressed;
-                    }
+                    xbox_state.buttons.dpad_down = camera.is_pressed(state);
                 }
 
                 if let Some(ref recovery) = config.recovery {
-                    if let Some(pressed) = state.get_button(&recovery.device_id, recovery.button_code) {
-                        xbox_state.buttons.dpad_left = pressed;
-                    }
+                    xbox_state.buttons.dpad_left = recovery.is_pressed(state);
                 }
 
+                if let Some(ref mirror_camera) = config.mirror_camera {
+                    xbox_state.buttons.dpad_right = mirror_camera.is_pressed(state);
+                }
+
+                // The booth menu draws these two as the wheel's cross and circle,
+                // and BoothInput.Confirm/Cancel already accept them.
+                if let Some(ref menu_confirm) = config.menu_confirm {
+                    xbox_state.buttons.a = menu_confirm.is_pressed(state);
+                }
+
+                if let Some(ref menu_cancel) = config.menu_cancel {
+                    xbox_state.buttons.b = menu_cancel.is_pressed(state);
+                }
+
+                // ButtonR1 is A-Chassis' stock ContlrClutch, which ShifterInput
+                // rebinds to ButtonR3 -- that is the only reason it is free. It is
+                // BoothInput.Next as well, so the game ignores it while a menu is
+                // open. ButtonL3 is not an option: the truck's A-Chassis debug
+                // plugins all toggle on it.
                 if let Some(ref parking_aid) = config.parking_aid {
-                    if let Some(pressed) = state.get_button(&parking_aid.device_id, parking_aid.button_code) {
-                        xbox_state.buttons.dpad_right = pressed;
-                    }
+                    xbox_state.buttons.right_bumper = parking_aid.is_pressed(state);
                 }
 
                 if let Some(ref gear_mode) = config.gear_mode {
-                    if let Some(pressed) = state.get_button(&gear_mode.device_id, gear_mode.button_code) {
-                        xbox_state.buttons.dpad_up = pressed;
-                    }
+                    xbox_state.buttons.dpad_up = gear_mode.is_pressed(state);
                 }
 
                 self.current_state = xbox_state.clone();
@@ -469,7 +492,14 @@ impl RoWheelApp {
                     });
                     ui.horizontal(|ui| {
                         ui.label(lamp(b.dpad_left, "Left Recovery"));
-                        ui.label(lamp(b.dpad_right, "Right Parking"));
+                        ui.label(lamp(b.dpad_right, "Right Mirror"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(lamp(b.a, "A Confirm"));
+                        ui.label(lamp(b.b, "B Back"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(lamp(b.right_bumper, "R1 Parking Aid"));
                     });
                 });
 

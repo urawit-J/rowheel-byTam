@@ -1,4 +1,4 @@
-use crate::config::{AxisBinding, ButtonBinding, WheelConfig, GEAR_MAX, GEAR_REVERSE};
+use crate::config::{AxisBinding, ButtonBinding, WheelConfig, GEAR_MAX, GEAR_REVERSE, HAT_THRESHOLD};
 use crate::input::InputEvent;
 use std::collections::HashMap;
 
@@ -19,13 +19,16 @@ pub enum CalibrationStep {
     Gear(i8),
     Camera,
     Recovery,
+    MirrorCamera,
+    MenuConfirm,
+    MenuCancel,
     ParkingAid,
     GearMode,
     Complete,
 }
 
 impl CalibrationStep {
-    pub const TOTAL_STEPS: usize = 24;
+    pub const TOTAL_STEPS: usize = 27;
 
     pub fn index(&self) -> usize {
         match self {
@@ -46,9 +49,12 @@ impl CalibrationStep {
             Self::Gear(g) => 10 + (*g as usize),
             Self::Camera => 19,
             Self::Recovery => 20,
-            Self::ParkingAid => 21,
-            Self::GearMode => 22,
-            Self::Complete => 23,
+            Self::MirrorCamera => 21,
+            Self::MenuConfirm => 22,
+            Self::MenuCancel => 23,
+            Self::ParkingAid => 24,
+            Self::GearMode => 25,
+            Self::Complete => 26,
         }
     }
 
@@ -65,6 +71,9 @@ impl CalibrationStep {
             Self::Gear(g) => format!("Shifter - Gear {}", g),
             Self::Camera => "Camera".to_string(),
             Self::Recovery => "Recovery".to_string(),
+            Self::MirrorCamera => "Mirror Camera".to_string(),
+            Self::MenuConfirm => "Menu Confirm".to_string(),
+            Self::MenuCancel => "Menu Back".to_string(),
             Self::ParkingAid => "Parking Aid".to_string(),
             Self::GearMode => "Transmission Mode".to_string(),
             Self::Complete => "Complete".to_string(),
@@ -95,8 +104,12 @@ impl CalibrationStep {
             Self::ClutchReleased => {
                 "Release the CLUTCH pedal completely, then continue".to_string()
             }
-            Self::ShiftUp => "Press the SHIFT UP paddle, then continue".to_string(),
-            Self::ShiftDown => "Press the SHIFT DOWN paddle, then continue".to_string(),
+            Self::ShiftUp => "Press the SHIFT UP paddle, then continue.
+(Also picks the next colour / gearbox in the booth menu)"
+                .to_string(),
+            Self::ShiftDown => "Press the SHIFT DOWN paddle, then continue.
+(Also picks the previous colour / gearbox)"
+                .to_string(),
             Self::Gear(GEAR_REVERSE) => {
                 "Engage REVERSE on the H-shifter, then continue.\n(Skip any gate your shifter does not have)"
                     .to_string()
@@ -107,7 +120,14 @@ impl CalibrationStep {
             ),
             Self::Camera => "Press the CAMERA button (wheel R3), then continue".to_string(),
             Self::Recovery => "Press the RECOVERY button (wheel L3), then continue".to_string(),
-            Self::ParkingAid => "Press the PARKING AID button (wheel L2), then continue".to_string(),
+            Self::MirrorCamera => "Press the MIRROR CAMERA button (wheel L2), then continue".to_string(),
+            Self::MenuConfirm => {
+                "Press the MENU CONFIRM button (wheel cross), then continue".to_string()
+            }
+            Self::MenuCancel => "Press the MENU BACK button (wheel circle), then continue".to_string(),
+            Self::ParkingAid => {
+                "Press the PARKING AID button (wheel triangle), then continue".to_string()
+            }
             Self::GearMode => {
                 "Press the TRANSMISSION MODE button (wheel R2), then continue".to_string()
             }
@@ -139,7 +159,10 @@ impl CalibrationStep {
             Self::Gear(g) if *g >= GEAR_MAX => Self::Gear(GEAR_REVERSE),
             Self::Gear(g) => Self::Gear(g + 1),
             Self::Camera => Self::Recovery,
-            Self::Recovery => Self::ParkingAid,
+            Self::Recovery => Self::MirrorCamera,
+            Self::MirrorCamera => Self::MenuConfirm,
+            Self::MenuConfirm => Self::MenuCancel,
+            Self::MenuCancel => Self::ParkingAid,
             Self::ParkingAid => Self::GearMode,
             Self::GearMode => Self::Complete,
             Self::Complete => Self::Complete,
@@ -180,7 +203,7 @@ pub struct CalibrationWizard {
     axis_trackers: HashMap<(String, u32), AxisTracker>,
     captured_axis: Option<(String, String, u32, f32)>, // device_id, device_name, axis_code, value
 
-    captured_button: Option<(String, String, u32)>, // device_id, device_name, button_code
+    captured_button: Option<ButtonBinding>,
 }
 
 impl CalibrationWizard {
@@ -222,11 +245,12 @@ impl CalibrationWizard {
                         return;
                     }
                 }
-                self.captured_button = Some((
-                    device_id.clone(),
-                    device_name.clone(),
-                    *button_code,
-                ));
+                self.captured_button = Some(ButtonBinding {
+                    device_id: device_id.clone(),
+                    device_name: device_name.clone(),
+                    button_code: *button_code,
+                    axis_direction: None,
+                });
             }
             _ => {}
         }
@@ -262,6 +286,35 @@ impl CalibrationWizard {
         };
 
         best(self.preferred_axis_device()).or_else(|| best(None))
+    }
+
+    /// The hat direction currently held over, if any.
+    ///
+    /// A wheel's D-pad is a POV hat: it reaches gilrs as an axis that snaps
+    /// between -1, 0 and +1, never as four buttons. Waiting only for a
+    /// ButtonPressed leaves those directions impossible to bind, which is what
+    /// made the G29 D-pad look like dead hardware. Require both a real movement
+    /// and a held deflection so a pedal resting off-centre cannot qualify.
+    fn held_hat(&self) -> Option<ButtonBinding> {
+        let tracker = self.get_most_moved_axis()?;
+        if tracker.movement() < HAT_THRESHOLD || tracker.current_value.abs() < HAT_THRESHOLD {
+            return None;
+        }
+        Some(ButtonBinding {
+            device_id: tracker.device_id.clone(),
+            device_name: tracker.device_name.clone(),
+            button_code: tracker.axis_code,
+            axis_direction: Some(if tracker.current_value < 0.0 { -1 } else { 1 }),
+        })
+    }
+
+    /// What a button step captured: a real button if one was pressed, otherwise
+    /// a hat direction.
+    fn take_button_or_hat(&mut self) -> Option<ButtonBinding> {
+        if let Some(binding) = self.captured_button.take() {
+            return Some(binding);
+        }
+        self.held_hat()
     }
 
     pub fn capture_axis_position(&mut self) {
@@ -382,21 +435,13 @@ impl CalibrationWizard {
                 }
             }
             CalibrationStep::ShiftUp => {
-                if let Some((device_id, device_name, button_code)) = self.captured_button.take() {
-                    self.config.shift_up = Some(ButtonBinding {
-                        device_id,
-                        device_name,
-                        button_code,
-                    });
+                if let Some(binding) = self.take_button_or_hat() {
+                    self.config.shift_up = Some(binding);
                 }
             }
             CalibrationStep::ShiftDown => {
-                if let Some((device_id, device_name, button_code)) = self.captured_button.take() {
-                    self.config.shift_down = Some(ButtonBinding {
-                        device_id,
-                        device_name,
-                        button_code,
-                    });
+                if let Some(binding) = self.take_button_or_hat() {
+                    self.config.shift_down = Some(binding);
                 }
             }
             CalibrationStep::Gear(gear) => {
@@ -404,51 +449,46 @@ impl CalibrationWizard {
                 // what was captured this time. Leaving a stale binding in place
                 // when nothing was captured is how a wrong gear survives a
                 // recalibration that was meant to correct it.
-                match self.captured_button.take() {
-                    Some((device_id, device_name, button_code)) => {
-                        self.config.set_gear(gear, ButtonBinding {
-                            device_id,
-                            device_name,
-                            button_code,
-                        });
+                match self.take_button_or_hat() {
+                    Some(binding) => {
+                        self.config.set_gear(gear, binding);
                     }
                     None => self.config.clear_gear(gear),
                 }
             }
             CalibrationStep::Camera => {
-                if let Some((device_id, device_name, button_code)) = self.captured_button.take() {
-                    self.config.camera = Some(ButtonBinding {
-                        device_id,
-                        device_name,
-                        button_code,
-                    });
+                if let Some(binding) = self.take_button_or_hat() {
+                    self.config.camera = Some(binding);
                 }
             }
             CalibrationStep::Recovery => {
-                if let Some((device_id, device_name, button_code)) = self.captured_button.take() {
-                    self.config.recovery = Some(ButtonBinding {
-                        device_id,
-                        device_name,
-                        button_code,
-                    });
+                if let Some(binding) = self.take_button_or_hat() {
+                    self.config.recovery = Some(binding);
+                }
+            }
+            CalibrationStep::MirrorCamera => {
+                if let Some(binding) = self.take_button_or_hat() {
+                    self.config.mirror_camera = Some(binding);
+                }
+            }
+            CalibrationStep::MenuConfirm => {
+                if let Some(binding) = self.take_button_or_hat() {
+                    self.config.menu_confirm = Some(binding);
+                }
+            }
+            CalibrationStep::MenuCancel => {
+                if let Some(binding) = self.take_button_or_hat() {
+                    self.config.menu_cancel = Some(binding);
                 }
             }
             CalibrationStep::ParkingAid => {
-                if let Some((device_id, device_name, button_code)) = self.captured_button.take() {
-                    self.config.parking_aid = Some(ButtonBinding {
-                        device_id,
-                        device_name,
-                        button_code,
-                    });
+                if let Some(binding) = self.take_button_or_hat() {
+                    self.config.parking_aid = Some(binding);
                 }
             }
             CalibrationStep::GearMode => {
-                if let Some((device_id, device_name, button_code)) = self.captured_button.take() {
-                    self.config.gear_mode = Some(ButtonBinding {
-                        device_id,
-                        device_name,
-                        button_code,
-                    });
+                if let Some(binding) = self.take_button_or_hat() {
+                    self.config.gear_mode = Some(binding);
                 }
             }
             // The config is written by `RoWheelApp::finish_calibration`, which
@@ -492,9 +532,13 @@ impl CalibrationWizard {
 
     /// Get info about the detected button for ui
     pub fn get_detected_button_info(&self) -> Option<String> {
-        self.captured_button.as_ref().map(|(_, name, code)| {
-            format!("{} - Button {}", name, code)
-        })
+        let binding = match self.captured_button.as_ref() {
+            Some(binding) => binding.clone(),
+            // Nothing pressed, but a hat may be held over. Show it, or a D-pad
+            // looks like dead hardware right up until the binding is saved.
+            None => self.held_hat()?,
+        };
+        Some(format!("{} - {}", binding.device_name, binding.describe()))
     }
 
     /// Are we in a step that needs axis detection?
@@ -521,6 +565,9 @@ impl CalibrationWizard {
                 | CalibrationStep::Gear(_)
                 | CalibrationStep::Camera
                 | CalibrationStep::Recovery
+                | CalibrationStep::MirrorCamera
+                | CalibrationStep::MenuConfirm
+                | CalibrationStep::MenuCancel
                 | CalibrationStep::ParkingAid
                 | CalibrationStep::GearMode
         )
@@ -583,6 +630,65 @@ mod tests {
             device_name: device.to_string(),
             button_code: code,
         }
+    }
+
+    fn axis(device: &str, code: u32, value: f32) -> InputEvent {
+        InputEvent::AxisMoved {
+            device_id: device.to_string(),
+            device_name: device.to_string(),
+            axis_code: code,
+            value,
+        }
+    }
+
+    /// Some controls report as a POV hat, which never produces a ButtonPressed.
+    /// A button step has to bind those from the axis, keeping the direction.
+    #[test]
+    fn a_button_step_binds_a_hat_direction_when_no_button_is_pressed() {
+        let mut wizard = CalibrationWizard::new(None);
+        wizard.step = CalibrationStep::Camera;
+        wizard.process_event(&axis("wheel", 9, 0.0));
+        wizard.process_event(&axis("wheel", 9, -1.0));
+        wizard.advance();
+
+        let binding = wizard.config.camera.expect("hat bound");
+        assert_eq!(binding.button_code, 9);
+        assert_eq!(binding.axis_direction, Some(-1));
+
+        // Held the other way, the same axis is a different control.
+        let mut other = CalibrationWizard::new(None);
+        other.step = CalibrationStep::MirrorCamera;
+        other.process_event(&axis("wheel", 9, 0.0));
+        other.process_event(&axis("wheel", 9, 1.0));
+        other.advance();
+        assert_eq!(other.config.mirror_camera.expect("hat bound").axis_direction, Some(1));
+    }
+
+    /// An axis that drifts but is not held over is not a hat press, or a pedal
+    /// resting off-centre would bind itself to whatever step is open.
+    #[test]
+    fn a_lightly_moved_axis_is_not_taken_for_a_hat() {
+        let mut wizard = CalibrationWizard::new(None);
+        wizard.step = CalibrationStep::Camera;
+        wizard.process_event(&axis("pedals", 2, 0.0));
+        wizard.process_event(&axis("pedals", 2, 0.3));
+        wizard.advance();
+        assert!(wizard.config.camera.is_none());
+    }
+
+    /// A real button still wins: the hat is only the fallback.
+    #[test]
+    fn a_pressed_button_beats_a_held_hat() {
+        let mut wizard = CalibrationWizard::new(None);
+        wizard.step = CalibrationStep::Camera;
+        wizard.process_event(&axis("wheel", 9, 0.0));
+        wizard.process_event(&axis("wheel", 9, -1.0));
+        wizard.process_event(&button("wheel", 4));
+        wizard.advance();
+
+        let binding = wizard.config.camera.expect("button bound");
+        assert_eq!(binding.button_code, 4);
+        assert_eq!(binding.axis_direction, None);
     }
 
     #[test]

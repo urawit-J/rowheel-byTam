@@ -5,6 +5,14 @@ use crate::input::InputReader;
 use crate::virtual_controller::{VirtualController, VirtualXboxController, XboxControllerState};
 use eframe::egui;
 
+/// What `connect_outputs` hands back: the virtual pad, the force-feedback
+/// device, and a status line for the UI.
+type OutputChannels = (
+    Option<Box<dyn VirtualController>>,
+    Option<Box<dyn ForceFeedback>>,
+    String,
+);
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
     Calibrating,
@@ -24,6 +32,11 @@ pub struct RoWheelApp {
     show_debug: bool,
 
     current_state: XboxControllerState,
+    /// Latched clutch state, so the engage/release hysteresis survives frames.
+    clutch_engaged: bool,
+    clutch_travel: f32,
+    /// Last gate position decoded from the H-shifter, for the debug panel.
+    current_gear: i8,
 }
 
 impl RoWheelApp {
@@ -54,29 +67,27 @@ impl RoWheelApp {
             None
         };
 
-        let virtual_controller: Option<Box<dyn VirtualController>> = if mode == AppMode::Running {
-            match VirtualXboxController::new() {
-                Ok(vc) => Some(Box::new(vc)),
-                Err(e) => {
-                    log::error!("Failed to create virtual controller: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let mut app_outputs = None;
+        if mode == AppMode::Running {
+            app_outputs = Some(Self::connect_outputs());
+        }
+        let (virtual_controller, force_feedback, status_message) =
+            app_outputs.unwrap_or((None, None, String::new()));
 
         Self {
             mode,
             config,
             input_reader,
             virtual_controller,
-            force_feedback: None,
+            force_feedback,
             calibration,
             detected_input_info: String::new(),
-            status_message: String::new(),
+            status_message,
             show_debug: false,
             current_state: XboxControllerState::default(),
+            clutch_engaged: false,
+            clutch_travel: 0.0,
+            current_gear: crate::config::GEAR_NEUTRAL,
         }
     }
 
@@ -86,32 +97,57 @@ impl RoWheelApp {
         self.virtual_controller = None;
     }
 
+    /// Bring up the virtual pad and the force-feedback device.
+    ///
+    /// Both startup and the end of calibration need this. Force feedback used
+    /// to be initialised only from `finish_calibration`, so once the config
+    /// persisted and the app booted straight into Running it would silently
+    /// never start.
+    fn connect_outputs() -> OutputChannels {
+        let (virtual_controller, status_message) = match VirtualXboxController::new() {
+            Ok(vc) => (
+                Some(Box::new(vc) as Box<dyn VirtualController>),
+                "Gamepad connected".to_string(),
+            ),
+            Err(e) => {
+                let msg = format!("Failed to create gamepad: {}", e);
+                log::error!("{}", msg);
+                (None, msg)
+            }
+        };
+
+        let force_feedback = match ForceFeedbackDevice::new(None) {
+            Ok(ff) if ff.is_available() => {
+                log::info!("Force feedback initialized");
+                Some(Box::new(ff) as Box<dyn ForceFeedback>)
+            }
+            Ok(_) => None,
+            Err(e) => {
+                log::warn!("Force feedback not available: {}", e);
+                None
+            }
+        };
+
+        (virtual_controller, force_feedback, status_message)
+    }
+
     fn finish_calibration(&mut self) {
         if let Some(ref calibration) = self.calibration {
-            self.config = Some(calibration.config.clone());
+            let config = calibration.config.clone();
 
-            match VirtualXboxController::new() {
-                Ok(vc) => {
-                    self.virtual_controller = Some(Box::new(vc));
-                    self.status_message = "Gamepad connected".to_string();
-                }
-                Err(e) => {
-                    self.status_message = format!("Failed to create gamepad: {}", e);
-                    log::error!("{}", self.status_message);
-                }
-            }
+            // The only place the config is written. The wizard's `Complete`
+            // arm never runs: `advance()` is driven by the Next button, which
+            // is not rendered on the final step.
+            let save_error = config.save().err().map(|e| {
+                log::error!("Failed to save config: {}", e);
+                format!("Failed to save config: {}", e)
+            });
+            self.config = Some(config);
 
-            match ForceFeedbackDevice::new(None) {
-                Ok(ff) => {
-                    if ff.is_available() {
-                        self.force_feedback = Some(Box::new(ff));
-                        log::info!("Force feedback initialized");
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Force feedback not available: {}", e);
-                }
-            }
+            let (vc, ff, status) = Self::connect_outputs();
+            self.virtual_controller = vc;
+            self.force_feedback = ff;
+            self.status_message = save_error.unwrap_or(status);
         }
 
         self.calibration = None;
@@ -153,12 +189,6 @@ impl RoWheelApp {
                     }
                 }
 
-                if let Some(ref clutch) = config.clutch {
-                    if let Some(value) = state.get_axis(&clutch.device_id, clutch.axis_code) {
-                        xbox_state.left_stick_y = clutch.normalize(value);
-                    }
-                }
-
                 if let Some(ref throttle) = config.throttle {
                     if let Some(value) = state.get_axis(&throttle.device_id, throttle.axis_code) {
                         xbox_state.right_trigger = throttle.normalize_trigger(value);
@@ -170,6 +200,28 @@ impl RoWheelApp {
                         xbox_state.left_trigger = brake.normalize_trigger(value);
                     }
                 }
+
+                // A-Chassis has no analog clutch -- `ContlrClutch` is a plain
+                // hold. Threshold the pedal with hysteresis so a foot resting
+                // near the bite point does not chatter the button.
+                if let Some(ref clutch) = config.clutch {
+                    if let Some(value) = state.get_axis(&clutch.device_id, clutch.axis_code) {
+                        let travel = clutch.normalize_trigger(value);
+                        self.clutch_engaged = if self.clutch_engaged {
+                            travel > config.clutch_release
+                        } else {
+                            travel >= config.clutch_engage
+                        };
+                        self.clutch_travel = travel;
+                    }
+                } else {
+                    self.clutch_engaged = false;
+                    self.clutch_travel = 0.0;
+                }
+                // ButtonR3 is the only digital button free in both the driving
+                // and the booth-menu maps; the stock ButtonR1 collides with
+                // BoothInput.Next, which a held clutch would jam.
+                xbox_state.buttons.right_thumb = self.clutch_engaged;
 
                 if let Some(ref shift_up) = config.shift_up {
                     if let Some(pressed) = state.get_button(&shift_up.device_id, shift_up.button_code) {
@@ -183,15 +235,45 @@ impl RoWheelApp {
                     }
                 }
 
-                if let Some(ref view_change) = config.view_change {
-                    if let Some(pressed) = state.get_button(&view_change.device_id, view_change.button_code) {
-                        xbox_state.buttons.back = pressed;
+                // H-pattern gear. The HGP reports every gate position as its own
+                // button, and no button pressed means the lever is in neutral.
+                //
+                // `config.gears` is kept sorted ascending, so reverse is examined
+                // first and wins: shifters that report reverse as "gear 7 plus a
+                // reverse button" hold two buttons at once, and reverse is the
+                // one the driver means. With no shifter configured both axes stay
+                // at rest, which is the game-side signal to ignore them.
+                if !config.gears.is_empty() {
+                    let gear = config
+                        .gears
+                        .iter()
+                        .find(|b| {
+                            state
+                                .get_button(&b.button.device_id, b.button.button_code)
+                                .unwrap_or(false)
+                        })
+                        .map(|b| b.gear)
+                        .unwrap_or(crate::config::GEAR_NEUTRAL);
+
+                    self.current_gear = gear;
+                    xbox_state.right_stick_x = crate::config::encode_gear(gear);
+                }
+
+                if let Some(ref camera) = config.camera {
+                    if let Some(pressed) = state.get_button(&camera.device_id, camera.button_code) {
+                        xbox_state.buttons.dpad_down = pressed;
                     }
                 }
 
-                if let Some(ref look_back) = config.look_back {
-                    if let Some(pressed) = state.get_button(&look_back.device_id, look_back.button_code) {
-                        xbox_state.buttons.b = pressed;
+                if let Some(ref recovery) = config.recovery {
+                    if let Some(pressed) = state.get_button(&recovery.device_id, recovery.button_code) {
+                        xbox_state.buttons.dpad_left = pressed;
+                    }
+                }
+
+                if let Some(ref parking_aid) = config.parking_aid {
+                    if let Some(pressed) = state.get_button(&parking_aid.device_id, parking_aid.button_code) {
+                        xbox_state.buttons.dpad_right = pressed;
                     }
                 }
 
@@ -237,19 +319,7 @@ impl RoWheelApp {
                     ui.add(egui::ProgressBar::new(progress).show_percentage());
                     ui.add_space(20.0);
 
-                    let step_name = match calibration.step {
-                        CalibrationStep::Welcome => "Welcome",
-                        CalibrationStep::SteeringLeft | CalibrationStep::SteeringRight => "Steering",
-                        CalibrationStep::ThrottlePressed | CalibrationStep::ThrottleReleased => "Throttle",
-                        CalibrationStep::BrakePressed | CalibrationStep::BrakeReleased => "Brake",
-                        CalibrationStep::ClutchPressed | CalibrationStep::ClutchReleased => "Clutch",
-                        CalibrationStep::ShiftUp => "Shift Up",
-                        CalibrationStep::ShiftDown => "Shift Down",
-                        CalibrationStep::ViewChange => "View Change",
-                        CalibrationStep::LookBack => "Look Back",
-                        CalibrationStep::GearMode => "Gear Mode",
-                        CalibrationStep::Complete => "Complete",
-                    };
+                    let step_name = calibration.step.title();
                     ui.label(egui::RichText::new(step_name).size(24.0).strong());
                     ui.add_space(15.0);
 
@@ -257,9 +327,47 @@ impl RoWheelApp {
                     ui.add_space(20.0);
 
                     if calibration.needs_axis_detection() || calibration.needs_button_detection() {
+                        let needs_button = calibration.needs_button_detection();
                         ui.group(|ui| {
                             ui.label("Detected:");
                             ui.label(egui::RichText::new(&self.detected_input_info).monospace());
+
+                            // Not every H-shifter reports every gate as a plain
+                            // button -- some gates report nothing at all. Show
+                            // what the hardware is actually sending so a gate
+                            // that cannot be bound is visible here rather than
+                            // silently skipped.
+                            if needs_button {
+                                ui.separator();
+                                ui.label("Buttons held right now:");
+                                let mut any = false;
+                                if let Some(ref reader) = self.input_reader {
+                                    for (device_id, buttons) in &reader.state().buttons {
+                                        let name = reader
+                                            .devices()
+                                            .get(device_id)
+                                            .map(|d| d.name.as_str())
+                                            .unwrap_or(device_id.as_str());
+                                        for (code, pressed) in buttons {
+                                            if *pressed {
+                                                any = true;
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "{} - button {}",
+                                                        name, code
+                                                    ))
+                                                    .monospace(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                if !any {
+                                    ui.label(
+                                        egui::RichText::new("(none)").monospace().weak(),
+                                    );
+                                }
+                            }
                         });
                         ui.add_space(20.0);
                     }
@@ -346,29 +454,59 @@ impl RoWheelApp {
 
                 columns[1].group(|ui| {
                     ui.label("Buttons");
+                    let lamp = |on: bool, text: &str| {
+                        let color = if on { egui::Color32::LIGHT_GREEN } else { egui::Color32::DARK_GRAY };
+                        egui::RichText::new(text).color(color)
+                    };
+                    let b = &self.current_state.buttons;
                     ui.horizontal(|ui| {
-                        let y_color = if self.current_state.buttons.y {
-                            egui::Color32::YELLOW
-                        } else {
-                            egui::Color32::DARK_GRAY
-                        };
-                        let x_color = if self.current_state.buttons.x {
-                            egui::Color32::BLUE
-                        } else {
-                            egui::Color32::DARK_GRAY
-                        };
-
-                        ui.label(egui::RichText::new("Y (Shift Up)").color(y_color));
-                        ui.label(egui::RichText::new("X (Shift Down)").color(x_color));
+                        ui.label(lamp(b.y, "Y Shift Up"));
+                        ui.label(lamp(b.x, "X Shift Down"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(lamp(b.dpad_up, "Up Trans"));
+                        ui.label(lamp(b.dpad_down, "Down Camera"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(lamp(b.dpad_left, "Left Recovery"));
+                        ui.label(lamp(b.dpad_right, "Right Parking"));
                     });
                 });
 
                 columns[1].add_space(10.0);
 
                 columns[1].group(|ui| {
-                    ui.label("Clutch (Left Stick Y)");
-                    let clutch_display = (self.current_state.left_stick_y + 1.0) / 2.0;
-                    ui.add(egui::ProgressBar::new(clutch_display).text("Clutch"));
+                    ui.label("Clutch (R3)");
+                    ui.add(
+                        egui::ProgressBar::new(self.clutch_travel).text(if self.clutch_engaged {
+                            "Clutch IN"
+                        } else {
+                            "Clutch out"
+                        }),
+                    );
+                });
+
+                columns[1].add_space(10.0);
+
+                columns[1].group(|ui| {
+                    ui.label("Shifter (Right Stick)");
+                    let gear = match self.current_gear {
+                        crate::config::GEAR_REVERSE => "R".to_string(),
+                        crate::config::GEAR_NEUTRAL => "N".to_string(),
+                        g => g.to_string(),
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("Gear {}", gear))
+                            .size(20.0)
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "x={:.2} y={:.2}",
+                            self.current_state.right_stick_x, self.current_state.right_stick_y
+                        ))
+                        .monospace(),
+                    );
                 });
             });
 
@@ -406,6 +544,29 @@ impl RoWheelApp {
                         if let Some(ref sd) = config.shift_down {
                             ui.label(format!("Shift Down: {} button {} (X={})",
                                 sd.device_name, sd.button_code, self.current_state.buttons.x));
+                        }
+                        for g in &config.gears {
+                            let label = match g.gear {
+                                crate::config::GEAR_REVERSE => "R".to_string(),
+                                n => n.to_string(),
+                            };
+                            let pressed = self
+                                .input_reader
+                                .as_ref()
+                                .and_then(|r| {
+                                    r.state().get_button(
+                                        &g.button.device_id,
+                                        g.button.button_code,
+                                    )
+                                })
+                                .unwrap_or(false);
+                            ui.label(format!(
+                                "Gear {}: {} button {} ({})",
+                                label,
+                                g.button.device_name,
+                                g.button.button_code,
+                                if pressed { "IN" } else { "-" }
+                            ));
                         }
                     });
                 }

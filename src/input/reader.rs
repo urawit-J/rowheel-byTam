@@ -42,13 +42,29 @@ impl InputReader {
         Ok(reader)
     }
 
+    /// Stable identity for a device.
+    ///
+    /// gilrs `GamepadId` is an enumeration index, so keying bindings on it
+    /// silently reassigns them to the wrong device when two controllers are
+    /// replugged in a different order -- which is exactly the G29 + shifter case.
+    /// The SDL-style UUID is stable across replugs; fall back to the name only
+    /// when a driver reports a nil UUID.
+    fn device_key(gamepad: &gilrs::Gamepad) -> String {
+        let uuid = gamepad.uuid();
+        if uuid == [0u8; 16] {
+            format!("name:{}", gamepad.name())
+        } else {
+            uuid.iter().map(|b| format!("{:02x}", b)).collect()
+        }
+    }
+
     fn refresh_devices(&mut self) {
         self.devices.clear();
         #[cfg(target_os = "linux")]
         self.evdev_readers.clear();
 
         for (id, gamepad) in self.gilrs.gamepads() {
-            let device_id = format!("{:?}", id);
+            let device_id = Self::device_key(&gamepad);
             
             let has_ff = gamepad.is_ff_supported();
 
@@ -60,8 +76,8 @@ impl InputReader {
                 has_force_feedback: has_ff,
             };
 
-            log::info!("Found device: {} ({}) - FF: {}",
-                device.name, device_id, device.has_force_feedback);
+            log::info!("Found device: {} ({}) [gilrs {:?}] - FF: {}",
+                device.name, device_id, id, device.has_force_feedback);
             
             #[cfg(target_os = "linux")]
             if let Some(path) = self.find_device_path(&gamepad) {
@@ -288,8 +304,8 @@ impl InputReader {
             match event.event {
                 #[cfg(not(target_os = "linux"))]
                 EventType::AxisChanged(axis, value, code) => {
-                    let device_id = format!("{:?}", event.id);
                     let gamepad = self.gilrs.gamepad(event.id);
+                    let device_id = Self::device_key(&gamepad);
                     let device_name = gamepad.name().to_string();
                     // Use raw code for better compatibility with sliders and non-standard axes
                     let axis_code = code.into_u32();
@@ -314,8 +330,8 @@ impl InputReader {
                 // gilrs often maps sliders to ButtonChanged events with analog values
                 #[cfg(not(target_os = "linux"))]
                 EventType::ButtonChanged(button, value, code) => {
-                    let device_id = format!("{:?}", event.id);
                     let gamepad = self.gilrs.gamepad(event.id);
+                    let device_id = Self::device_key(&gamepad);
                     let device_name = gamepad.name().to_string();
                     // Use raw code with high bit set to distinguish from regular axes
                     let axis_code = code.into_u32() | 0x80000000;
@@ -337,8 +353,8 @@ impl InputReader {
                     });
                 }
                 EventType::ButtonPressed(button, code) => {
-                    let device_id = format!("{:?}", event.id);
                     let gamepad = self.gilrs.gamepad(event.id);
+                    let device_id = Self::device_key(&gamepad);
                     let device_name = gamepad.name().to_string();
                     let button_code = code.into_u32();
 
@@ -357,8 +373,8 @@ impl InputReader {
                     });
                 }
                 EventType::ButtonReleased(button, code) => {
-                    let device_id = format!("{:?}", event.id);
                     let gamepad = self.gilrs.gamepad(event.id);
+                    let device_id = Self::device_key(&gamepad);
                     let device_name = gamepad.name().to_string();
                     let button_code = code.into_u32();
 
@@ -378,14 +394,15 @@ impl InputReader {
                 }
                 EventType::Connected => {
                     refresh_needed = true;
-                    if let Some(device) = self.devices.get(&format!("{:?}", event.id)) {
+                    let key = Self::device_key(&self.gilrs.gamepad(event.id));
+                    if let Some(device) = self.devices.get(&key) {
                         events.push(InputEvent::DeviceConnected {
                             device: device.clone(),
                         });
                     }
                 }
                 EventType::Disconnected => {
-                    events.push(InputEvent::DeviceDisconnected { device_id: format!("{:?}", event.id) });
+                    events.push(InputEvent::DeviceDisconnected { device_id: Self::device_key(&self.gilrs.gamepad(event.id)) });
                     refresh_needed = true;
                 }
                 _ => {}
@@ -397,8 +414,8 @@ impl InputReader {
             let mut disconnected_readers = Vec::new();
             for (id, rx) in &self.evdev_readers {
                 while let Ok(ev) = rx.try_recv() {
-                    let device_id = format!("{:?}", id);
                     let gamepad = self.gilrs.gamepad(*id);
+                    let device_id = Self::device_key(&gamepad);
                     let device_name = gamepad.name().to_string();
 
                     match ev {

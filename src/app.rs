@@ -184,8 +184,8 @@ impl RoWheelApp {
     /// to be initialised only from `finish_calibration`, so once the config
     /// persisted and the app booted straight into Running it would silently
     /// never start.
-    fn connect_outputs() -> OutputChannels {
-        let (virtual_controller, status_message) = match VirtualXboxController::new() {
+    fn connect_pad() -> (Option<Box<dyn VirtualController>>, String) {
+        match VirtualXboxController::new() {
             Ok(vc) => (
                 Some(Box::new(vc) as Box<dyn VirtualController>),
                 "เชื่อมต่อจอยเสมือนแล้ว".to_string(),
@@ -195,7 +195,37 @@ impl RoWheelApp {
                 log::error!("{}", msg);
                 (None, msg)
             }
-        };
+        }
+    }
+
+    /// Take the virtual pad away, or bring it back.
+    ///
+    /// Roblox treats whichever device is reporting as the active one and flips
+    /// its UI to match, and this pad never stops reporting: the gear axis is
+    /// dithered on purpose so a held gate keeps producing change events (see
+    /// `GEAR_AXIS_DITHER`). Clicking into the game while that is going on is a
+    /// fight, and closing rowheel and reopening it afterwards was the way round
+    /// it. This is the same thing without losing the window.
+    ///
+    /// The target is dropped rather than merely ignored, so Windows sees the
+    /// pad disappear exactly as it would if the process had exited -- ignoring
+    /// it would leave an idle pad present, which is still a pad for Roblox to
+    /// switch to. Force feedback is left alone: it belongs to the real wheel
+    /// and has nothing to do with what Roblox is looking at.
+    fn set_output_active(&mut self, active: bool) {
+        if !active {
+            self.virtual_controller = None;
+            self.status_message =
+                "หยุดส่งสัญญาณแล้ว — คลิกเข้าเกมให้เรียบร้อย แล้วค่อยกดเริ่มส่งสัญญาณ".to_string();
+            return;
+        }
+        let (virtual_controller, status_message) = Self::connect_pad();
+        self.virtual_controller = virtual_controller;
+        self.status_message = status_message;
+    }
+
+    fn connect_outputs() -> OutputChannels {
+        let (virtual_controller, status_message) = Self::connect_pad();
 
         let force_feedback = match ForceFeedbackDevice::new(None) {
             Ok(ff) if ff.is_available() => {
@@ -620,6 +650,22 @@ impl RoWheelApp {
                 ui.separator();
                 if ui.button("ตั้งค่าใหม่").clicked() {
                     self.start_calibration();
+                }
+                ui.separator();
+                let sending = self.virtual_controller.is_some();
+                if ui
+                    .button(if sending {
+                        "หยุดส่งสัญญาณ"
+                    } else {
+                        "เริ่มส่งสัญญาณ"
+                    })
+                    .on_hover_text(
+                        "ปิดไว้ตอนคลิกเข้าเกม Roblox แล้วค่อยเปิดอีกที\n\
+                         จอยเสมือนจะหายไปจากเครื่องเหมือนตอนปิดโปรแกรม",
+                    )
+                    .clicked()
+                {
+                    self.set_output_active(!sending);
                 }
                 ui.separator();
                 ui.checkbox(&mut self.show_debug, "ข้อมูลดีบัก");

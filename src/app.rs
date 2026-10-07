@@ -26,6 +26,9 @@ pub struct RoWheelApp {
     virtual_controller: Option<Box<dyn VirtualController>>,
     force_feedback: Option<Box<dyn ForceFeedback>>,
     calibration: Option<CalibrationWizard>,
+    /// The G29 photo the wizard rings. `None` only if the asset failed to
+    /// decode, in which case calibration still works, just with words alone.
+    wheel_photo: Option<egui::TextureHandle>,
 
     detected_input_info: String,
     status_message: String,
@@ -43,10 +46,81 @@ pub struct RoWheelApp {
     gear_dither_at: std::time::Instant,
 }
 
+/// Amber reads as "look here" against both the black wheel and the white
+/// background the photo is cut out on.
+const HIGHLIGHT: egui::Color32 = egui::Color32::from_rgb(255, 170, 0);
+const HIGHLIGHT_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(90, 60, 0, 90);
+
+/// Windows fonts that carry Thai, best first. Leelawadee UI is the system UI
+/// face and sets Latin alongside Thai without the two looking like different
+/// documents; Tahoma is the fallback that has shipped with Windows for decades.
+const THAI_FONTS: [&str; 2] = [
+    r"C:\Windows\Fonts\leelawui.ttf",
+    r"C:\Windows\Fonts\tahoma.ttf",
+];
+
 impl RoWheelApp {
+    /// The UI is Thai, and egui's bundled faces have no Thai glyphs at all --
+    /// without this every label renders as empty boxes. The font is read from
+    /// the system rather than embedded: this only ever runs on the booth PC,
+    /// and 400KB of font does not belong in the repository.
+    ///
+    /// If neither face is there the app still starts, in English-only glyphs,
+    /// rather than refusing to run.
+    fn fonts() -> egui::FontDefinitions {
+        let mut fonts = egui::FontDefinitions::default();
+        for path in THAI_FONTS {
+            let Ok(data) = std::fs::read(path) else {
+                continue;
+            };
+            fonts
+                .font_data
+                .insert("thai".to_owned(), egui::FontData::from_owned(data).into());
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                // Ahead of the default face, so Thai is drawn by the font that
+                // has it and everything else still falls through as before.
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .insert(0, "thai".to_owned());
+            }
+            return fonts;
+        }
+        log::warn!("no Thai font found on this machine; labels will not render");
+        fonts
+    }
+
+    /// The photo is baked into the binary rather than shipped beside it: the
+    /// booth PC gets one file, and a wizard whose pictures can go missing is
+    /// exactly the wizard that fails on event morning.
+    fn load_wheel_photo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        let decoded = match image::load_from_memory(include_bytes!("../assets/g29.jpg")) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                log::error!("could not decode the wheel photo: {}", e);
+                return None;
+            }
+        };
+        // The asset is 2000x2000 because the labels on the wheel had to be
+        // legible while the spots were measured off it. Nothing ever draws it
+        // larger than a few hundred points, and the full size would sit in
+        // video memory as 16MB of RGBA.
+        const TEXTURE_SIZE: u32 = 800;
+        let decoded = decoded
+            .resize(
+                TEXTURE_SIZE,
+                TEXTURE_SIZE,
+                image::imageops::FilterType::CatmullRom,
+            )
+            .to_rgba8();
+        let size = [decoded.width() as usize, decoded.height() as usize];
+        let image = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
+        Some(ctx.load_texture("g29", image, egui::TextureOptions::LINEAR))
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let fonts = egui::FontDefinitions::default();
-        cc.egui_ctx.set_fonts(fonts);
+        cc.egui_ctx.set_fonts(Self::fonts());
 
         let config = WheelConfig::load();
         let has_config = config.as_ref().map(|c| c.is_complete()).unwrap_or(false);
@@ -85,6 +159,7 @@ impl RoWheelApp {
             virtual_controller,
             force_feedback,
             calibration,
+            wheel_photo: Self::load_wheel_photo(&cc.egui_ctx),
             detected_input_info: String::new(),
             status_message,
             show_debug: false,
@@ -113,7 +188,7 @@ impl RoWheelApp {
         let (virtual_controller, status_message) = match VirtualXboxController::new() {
             Ok(vc) => (
                 Some(Box::new(vc) as Box<dyn VirtualController>),
-                "Gamepad connected".to_string(),
+                "เชื่อมต่อจอยเสมือนแล้ว".to_string(),
             ),
             Err(e) => {
                 let msg = format!("Failed to create gamepad: {}", e);
@@ -160,6 +235,32 @@ impl RoWheelApp {
         self.mode = AppMode::Running;
     }
 
+    /// Leave calibration without walking to the end, for rebinding one control
+    /// without redoing the other twenty-six.
+    ///
+    /// Nothing special is needed to keep the rest: `start_calibration` seeds the
+    /// wizard from the config that is already loaded, so every step not reached
+    /// still holds the binding it had, and saving writes those back unchanged.
+    fn exit_calibration(&mut self) {
+        let unusable = self
+            .calibration
+            .as_ref()
+            .is_some_and(|c| !c.config.is_complete());
+
+        self.finish_calibration();
+
+        // Writing a half-filled config is safe -- the startup gate is
+        // `is_complete()`, so it reopens the wizard next launch rather than
+        // booting past it -- but the screen it lands on now would otherwise
+        // look like a working rig that simply ignores the wheel.
+        if unusable {
+            self.status_message = format!(
+                "ยังตั้งค่าไม่ครบ: พวงมาลัย แป้นเหยียบ หรือแป้นเกียร์ ยังไม่ได้ผูกปุ่ม · {}",
+                self.status_message
+            );
+        }
+    }
+
     fn process_inputs(&mut self) {
         let Some(ref mut reader) = self.input_reader else {
             return;
@@ -175,11 +276,11 @@ impl RoWheelApp {
             if calibration.needs_axis_detection() {
                 self.detected_input_info = calibration
                     .get_detected_axis_info()
-                    .unwrap_or_else(|| "Move an input...".to_string());
+                    .unwrap_or_else(|| "ขยับอุปกรณ์ที่ต้องการ...".to_string());
             } else if calibration.needs_button_detection() {
                 self.detected_input_info = calibration
                     .get_detected_button_info()
-                    .unwrap_or_else(|| "Press a button...".to_string());
+                    .unwrap_or_else(|| "กดปุ่มที่ต้องการ...".to_string());
             }
         }
 
@@ -293,15 +394,6 @@ impl RoWheelApp {
                     xbox_state.buttons.b = menu_cancel.is_pressed(state);
                 }
 
-                // ButtonR1 is A-Chassis' stock ContlrClutch, which ShifterInput
-                // rebinds to ButtonR3 -- that is the only reason it is free. It is
-                // BoothInput.Next as well, so the game ignores it while a menu is
-                // open. ButtonL3 is not an option: the truck's A-Chassis debug
-                // plugins all toggle on it.
-                if let Some(ref parking_aid) = config.parking_aid {
-                    xbox_state.buttons.right_bumper = parking_aid.is_pressed(state);
-                }
-
                 if let Some(ref gear_mode) = config.gear_mode {
                     xbox_state.buttons.dpad_up = gear_mode.is_pressed(state);
                 }
@@ -315,8 +407,11 @@ impl RoWheelApp {
 
                     if let Ok(rumble) = vc.get_rumble() {
                         if rumble.large_motor > 0.01 || rumble.small_motor > 0.01 {
-                            log::info!("Rumble from game: large={:.2}, small={:.2}",
-                                       rumble.large_motor, rumble.small_motor);
+                            log::info!(
+                                "Rumble from game: large={:.2}, small={:.2}",
+                                rumble.large_motor,
+                                rumble.small_motor
+                            );
                         }
                         if let Some(ref mut ff) = self.force_feedback {
                             if let Err(e) = ff.apply_rumble(&rumble) {
@@ -330,99 +425,191 @@ impl RoWheelApp {
     }
 
     fn render_calibration_ui(&mut self, ctx: &egui::Context) {
+        // Claims its height before the content does, so Next can never be
+        // pushed out of reach.
+        self.render_calibration_controls(ctx);
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(20.0);
-                ui.heading("RoWheel Calibration");
-                ui.add_space(30.0);
-
-                if let Some(ref calibration) = self.calibration {
-                    let progress = calibration.step.index() as f32 / CalibrationStep::TOTAL_STEPS as f32;
-
-                    ui.add(egui::ProgressBar::new(progress).show_percentage());
+            // And whatever is left still scrolls, for a window too short even
+            // for the photo.
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.vertical_centered(|ui| {
                     ui.add_space(20.0);
+                    ui.heading("ตั้งค่าพวงมาลัย RoWheel");
+                    ui.add_space(30.0);
 
-                    let step_name = calibration.step.title();
-                    ui.label(egui::RichText::new(step_name).size(24.0).strong());
-                    ui.add_space(15.0);
+                    if let Some(ref calibration) = self.calibration {
+                        let progress =
+                            calibration.step.index() as f32 / CalibrationStep::TOTAL_STEPS as f32;
 
-                    ui.label(egui::RichText::new(calibration.step.instructions()).size(16.0));
-                    ui.add_space(20.0);
+                        ui.add(egui::ProgressBar::new(progress).show_percentage());
+                        ui.add_space(20.0);
 
-                    if calibration.needs_axis_detection() || calibration.needs_button_detection() {
-                        let needs_button = calibration.needs_button_detection();
-                        ui.group(|ui| {
-                            ui.label("Detected:");
-                            ui.label(egui::RichText::new(&self.detected_input_info).monospace());
+                        let step_name = calibration.step.title();
+                        ui.label(egui::RichText::new(step_name).size(24.0).strong());
+                        ui.add_space(15.0);
 
-                            // Not every H-shifter reports every gate as a plain
-                            // button -- some gates report nothing at all. Show
-                            // what the hardware is actually sending so a gate
-                            // that cannot be bound is visible here rather than
-                            // silently skipped.
-                            if needs_button {
-                                ui.separator();
-                                ui.label("Buttons held right now:");
-                                let mut any = false;
-                                if let Some(ref reader) = self.input_reader {
-                                    for (device_id, buttons) in &reader.state().buttons {
-                                        let name = reader
-                                            .devices()
-                                            .get(device_id)
-                                            .map(|d| d.name.as_str())
-                                            .unwrap_or(device_id.as_str());
-                                        for (code, pressed) in buttons {
-                                            if *pressed {
-                                                any = true;
-                                                ui.label(
-                                                    egui::RichText::new(format!(
-                                                        "{} - button {}",
-                                                        name, code
-                                                    ))
-                                                    .monospace(),
-                                                );
+                        ui.label(egui::RichText::new(calibration.step.instructions()).size(16.0));
+                        ui.add_space(14.0);
+
+                        // The control this step wants, ringed on the photo. Whoever
+                        // sets the booth up on the day did not choose the mapping,
+                        // and "L2" is only a name until you can see which one it is.
+                        let spots = calibration.step.spots();
+                        if let (false, Some(photo)) = (spots.is_empty(), self.wheel_photo.as_ref())
+                        {
+                            // Sized off the window rather than fixed: the booth PC
+                            // is not the machine this was written on.
+                            let side = (ui.available_width() - 40.0).clamp(160.0, 340.0);
+                            let shown =
+                                egui::load::SizedTexture::new(photo.id(), egui::vec2(side, side));
+                            let rect = ui.add(egui::Image::from_texture(shown)).rect;
+                            let painter = ui.painter();
+                            for spot in spots {
+                                let marked = egui::Rect::from_min_size(
+                                    rect.min
+                                        + egui::vec2(spot.x * rect.width(), spot.y * rect.height()),
+                                    egui::vec2(spot.w * rect.width(), spot.h * rect.height()),
+                                )
+                                .expand(3.0);
+                                // Filled as well as ringed: a thin outline on a
+                                // photo of a black wheel is easy to miss.
+                                painter.rect_filled(marked, 6.0, HIGHLIGHT_FILL);
+                                painter.rect_stroke(
+                                    marked,
+                                    6.0,
+                                    egui::Stroke::new(3.0_f32, HIGHLIGHT),
+                                    egui::StrokeKind::Outside,
+                                );
+                            }
+                            ui.add_space(14.0);
+                        }
+                        ui.add_space(6.0);
+
+                        if calibration.needs_axis_detection()
+                            || calibration.needs_button_detection()
+                        {
+                            let needs_button = calibration.needs_button_detection();
+                            ui.group(|ui| {
+                                ui.label("ตรวจพบ:");
+                                ui.label(
+                                    egui::RichText::new(&self.detected_input_info).monospace(),
+                                );
+
+                                // Not every H-shifter reports every gate as a plain
+                                // button -- some gates report nothing at all. Show
+                                // what the hardware is actually sending so a gate
+                                // that cannot be bound is visible here rather than
+                                // silently skipped.
+                                if needs_button {
+                                    ui.separator();
+                                    ui.label("ปุ่มที่กดค้างอยู่ตอนนี้:");
+                                    let mut any = false;
+                                    if let Some(ref reader) = self.input_reader {
+                                        for (device_id, buttons) in &reader.state().buttons {
+                                            let name = reader
+                                                .devices()
+                                                .get(device_id)
+                                                .map(|d| d.name.as_str())
+                                                .unwrap_or(device_id.as_str());
+                                            for (code, pressed) in buttons {
+                                                if *pressed {
+                                                    any = true;
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "{} - button {}",
+                                                            name, code
+                                                        ))
+                                                        .monospace(),
+                                                    );
+                                                }
                                             }
                                         }
                                     }
+                                    if !any {
+                                        ui.label(egui::RichText::new("(none)").monospace().weak());
+                                    }
                                 }
-                                if !any {
-                                    ui.label(
-                                        egui::RichText::new("(none)").monospace().weak(),
-                                    );
-                                }
-                            }
-                        });
-                        ui.add_space(20.0);
-                    }
-                }
-
-                let (is_complete, can_skip) = self.calibration
-                    .as_ref()
-                    .map(|c| (c.step == CalibrationStep::Complete, c.step.can_skip()))
-                    .unwrap_or((false, false));
-
-                ui.horizontal(|ui| {
-                    if is_complete {
-                        if ui.button(egui::RichText::new("Start").size(18.0)).clicked() {
-                            self.finish_calibration();
-                        }
-                    } else if self.calibration.is_some() {
-                        if ui.button(egui::RichText::new("Next").size(18.0)).clicked() {
-                            if let Some(ref mut cal) = self.calibration {
-                                cal.advance();
-                            }
-                        }
-
-                        if can_skip {
-                            if ui.button(egui::RichText::new("Skip").size(18.0)).clicked() {
-                                if let Some(ref mut cal) = self.calibration {
-                                    cal.skip();
-                                }
-                            }
+                            });
+                            ui.add_space(20.0);
                         }
                     }
                 });
             });
+        });
+    }
+
+    /// The step controls, in a panel of their own.
+    ///
+    /// They used to sit under the content, and on the booth PC's 600px-tall
+    /// window the photo pushed Next clean off the bottom with no way to reach
+    /// it. A bottom panel is laid out first and keeps its height whatever the
+    /// step above is showing.
+    fn render_calibration_controls(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("calibration_controls").show(ctx, |ui| {
+            ui.add_space(10.0);
+            let (is_complete, can_skip, can_go_back) = self
+                .calibration
+                .as_ref()
+                .map(|c| {
+                    (
+                        c.step == CalibrationStep::Complete,
+                        c.step.can_skip(),
+                        c.step != CalibrationStep::Welcome,
+                    )
+                })
+                .unwrap_or((false, false, false));
+
+            ui.horizontal(|ui| {
+                // Offered on Complete too: the last step is the one most
+                // worth a second look before the config is written.
+                if can_go_back
+                    && ui
+                        .button(egui::RichText::new("ย้อนกลับ").size(18.0))
+                        .clicked()
+                {
+                    if let Some(ref mut cal) = self.calibration {
+                        cal.back();
+                    }
+                }
+
+                if is_complete {
+                    if ui
+                        .button(egui::RichText::new("เริ่มใช้งาน").size(18.0))
+                        .clicked()
+                    {
+                        self.finish_calibration();
+                    }
+                } else if self.calibration.is_some() {
+                    if ui.button(egui::RichText::new("ถัดไป").size(18.0)).clicked() {
+                        if let Some(ref mut cal) = self.calibration {
+                            cal.advance();
+                        }
+                    }
+
+                    if can_skip {
+                        if ui.button(egui::RichText::new("ข้าม").size(18.0)).clicked() {
+                            if let Some(ref mut cal) = self.calibration {
+                                cal.skip();
+                            }
+                        }
+                    }
+
+                    // Set apart from the step controls: this one ends the
+                    // wizard rather than moving through it.
+                    ui.add_space(24.0);
+                    if ui
+                        .button(egui::RichText::new("ออกจากการตั้งค่า").size(18.0))
+                        .on_hover_text(
+                            "ออกตอนนี้โดยเก็บค่าที่ตั้งไปแล้วไว้\n\
+                                 ขั้นที่ยังไม่ได้ทำ จะใช้ค่าเดิมที่เคยตั้งไว้",
+                        )
+                        .clicked()
+                    {
+                        self.exit_calibration();
+                    }
+                }
+            });
+            ui.add_space(10.0);
         });
     }
 
@@ -431,16 +618,21 @@ impl RoWheelApp {
             ui.horizontal(|ui| {
                 ui.heading("RoWheel");
                 ui.separator();
-                if ui.button("Recalibrate").clicked() {
+                if ui.button("ตั้งค่าใหม่").clicked() {
                     self.start_calibration();
                 }
                 ui.separator();
-                ui.checkbox(&mut self.show_debug, "Debug");
+                ui.checkbox(&mut self.show_debug, "ข้อมูลดีบัก");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let status = if self.virtual_controller.as_ref().map(|vc| vc.is_connected()).unwrap_or(false) {
-                        egui::RichText::new("Connected").color(egui::Color32::GREEN)
+                    let status = if self
+                        .virtual_controller
+                        .as_ref()
+                        .map(|vc| vc.is_connected())
+                        .unwrap_or(false)
+                    {
+                        egui::RichText::new("เชื่อมต่อแล้ว").color(egui::Color32::GREEN)
                     } else {
-                        egui::RichText::new("Disconnected").color(egui::Color32::RED)
+                        egui::RichText::new("ไม่ได้เชื่อมต่อ").color(egui::Color32::RED)
                     };
                     ui.label(status);
                 });
@@ -453,80 +645,81 @@ impl RoWheelApp {
                 ui.add_space(10.0);
             }
 
-            ui.heading("Gamepad Output");
+            ui.heading("สัญญาณที่ส่งออก");
             ui.add_space(10.0);
 
             ui.columns(2, |columns| {
                 columns[0].group(|ui| {
-                    ui.label("Left Stick");
+                    ui.label("แกนพวงมาลัย");
                     ui.horizontal(|ui| {
                         ui.label(format!("X: {:.2}", self.current_state.left_stick_x));
                         ui.label(format!("Y: {:.2}", self.current_state.left_stick_y));
                     });
                     let stick_x = (self.current_state.left_stick_x + 1.0) / 2.0;
-                    ui.add(egui::ProgressBar::new(stick_x).text("Steering"));
+                    ui.add(egui::ProgressBar::new(stick_x).text("พวงมาลัย"));
                 });
 
                 columns[0].add_space(10.0);
 
                 columns[0].group(|ui| {
-                    ui.label("Triggers");
-                    ui.add(egui::ProgressBar::new(self.current_state.left_trigger).text("Brake (LT)"));
-                    ui.add(egui::ProgressBar::new(self.current_state.right_trigger).text("Throttle (RT)"));
+                    ui.label("แป้นเหยียบ");
+                    ui.add(egui::ProgressBar::new(self.current_state.left_trigger).text("เบรก"));
+                    ui.add(egui::ProgressBar::new(self.current_state.right_trigger).text("คันเร่ง"));
                 });
 
                 columns[1].group(|ui| {
-                    ui.label("Buttons");
+                    ui.label("ปุ่ม");
                     let lamp = |on: bool, text: &str| {
-                        let color = if on { egui::Color32::LIGHT_GREEN } else { egui::Color32::DARK_GRAY };
+                        let color = if on {
+                            egui::Color32::LIGHT_GREEN
+                        } else {
+                            egui::Color32::DARK_GRAY
+                        };
                         egui::RichText::new(text).color(color)
                     };
                     let b = &self.current_state.buttons;
+                    // One to a row: these two names side by side ran off the
+                    // edge of the panel.
+                    ui.label(lamp(b.y, "paddle shift ขวา · เปลี่ยนเกียร์ขึ้น"));
+                    ui.label(lamp(b.x, "paddle shift ซ้าย · เปลี่ยนเกียร์ลง"));
                     ui.horizontal(|ui| {
-                        ui.label(lamp(b.y, "Y Shift Up"));
-                        ui.label(lamp(b.x, "X Shift Down"));
+                        ui.label(lamp(b.dpad_up, "R2 · โหมดเกียร์"));
+                        ui.label(lamp(b.dpad_down, "R3 · มุมกล้อง"));
                     });
                     ui.horizontal(|ui| {
-                        ui.label(lamp(b.dpad_up, "Up Trans"));
-                        ui.label(lamp(b.dpad_down, "Down Camera"));
+                        ui.label(lamp(b.dpad_left, "L3 · กู้รถ"));
+                        ui.label(lamp(b.dpad_right, "L2 · กระจกมองข้าง"));
                     });
                     ui.horizontal(|ui| {
-                        ui.label(lamp(b.dpad_left, "Left Recovery"));
-                        ui.label(lamp(b.dpad_right, "Right Mirror"));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(lamp(b.a, "A Confirm"));
-                        ui.label(lamp(b.b, "B Back"));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(lamp(b.right_bumper, "R1 Parking Aid"));
+                        ui.label(lamp(b.a, "× · ยืนยัน"));
+                        ui.label(lamp(b.b, "○ · ย้อนกลับ"));
                     });
                 });
 
                 columns[1].add_space(10.0);
 
                 columns[1].group(|ui| {
-                    ui.label("Clutch (R3)");
-                    ui.add(
-                        egui::ProgressBar::new(self.clutch_travel).text(if self.clutch_engaged {
-                            "Clutch IN"
+                    ui.label("คลัตช์");
+                    ui.add(egui::ProgressBar::new(self.clutch_travel).text(
+                        if self.clutch_engaged {
+                            "เหยียบอยู่"
                         } else {
-                            "Clutch out"
-                        }),
-                    );
+                            "ปล่อย"
+                        },
+                    ));
                 });
 
                 columns[1].add_space(10.0);
 
                 columns[1].group(|ui| {
-                    ui.label("Shifter (Right Stick)");
+                    ui.label("คันเกียร์");
                     let gear = match self.current_gear {
                         crate::config::GEAR_REVERSE => "R".to_string(),
                         crate::config::GEAR_NEUTRAL => "N".to_string(),
                         g => g.to_string(),
                     };
                     ui.label(
-                        egui::RichText::new(format!("Gear {}", gear))
+                        egui::RichText::new(format!("เกียร์ {}", gear))
                             .size(20.0)
                             .strong(),
                     );
@@ -543,37 +736,54 @@ impl RoWheelApp {
             if self.show_debug {
                 ui.add_space(20.0);
                 ui.separator();
-                ui.heading("Debug Info");
+                ui.heading("ข้อมูลดีบัก");
 
                 if let Some(ref config) = self.config {
-                    ui.collapsing("Configuration", |ui| {
+                    ui.collapsing("ค่าที่ตั้งไว้", |ui| {
                         if let Some(ref s) = config.steering {
-                            let raw_value = self.input_reader.as_ref()
+                            let raw_value = self
+                                .input_reader
+                                .as_ref()
                                 .and_then(|r| r.state().get_axis(&s.device_id, s.axis_code));
-                            ui.label(format!("Steering: axis {} cal=[{:.6}, {:.6}]",
-                                s.axis_code, s.min_value, s.max_value));
-                            ui.label(format!("  raw={:.6} out={:.6}",
-                                raw_value.unwrap_or(0.0), self.current_state.left_stick_x));
+                            ui.label(format!(
+                                "Steering: axis {} cal=[{:.6}, {:.6}]",
+                                s.axis_code, s.min_value, s.max_value
+                            ));
+                            ui.label(format!(
+                                "  raw={:.6} out={:.6}",
+                                raw_value.unwrap_or(0.0),
+                                self.current_state.left_stick_x
+                            ));
                         }
                         if let Some(ref t) = config.throttle {
-                            ui.label(format!("Throttle: {} axis {} [{:.2} - {:.2}]",
-                                t.device_name, t.axis_code, t.min_value, t.max_value));
+                            ui.label(format!(
+                                "Throttle: {} axis {} [{:.2} - {:.2}]",
+                                t.device_name, t.axis_code, t.min_value, t.max_value
+                            ));
                         }
                         if let Some(ref b) = config.brake {
-                            ui.label(format!("Brake: {} axis {} [{:.2} - {:.2}]",
-                                b.device_name, b.axis_code, b.min_value, b.max_value));
+                            ui.label(format!(
+                                "Brake: {} axis {} [{:.2} - {:.2}]",
+                                b.device_name, b.axis_code, b.min_value, b.max_value
+                            ));
                         }
                         if let Some(ref c) = config.clutch {
-                            ui.label(format!("Clutch: {} axis {} [{:.2} - {:.2}]",
-                                c.device_name, c.axis_code, c.min_value, c.max_value));
+                            ui.label(format!(
+                                "Clutch: {} axis {} [{:.2} - {:.2}]",
+                                c.device_name, c.axis_code, c.min_value, c.max_value
+                            ));
                         }
                         if let Some(ref su) = config.shift_up {
-                            ui.label(format!("Shift Up: {} button {} (Y={})",
-                                su.device_name, su.button_code, self.current_state.buttons.y));
+                            ui.label(format!(
+                                "Shift Up: {} button {} (Y={})",
+                                su.device_name, su.button_code, self.current_state.buttons.y
+                            ));
                         }
                         if let Some(ref sd) = config.shift_down {
-                            ui.label(format!("Shift Down: {} button {} (X={})",
-                                sd.device_name, sd.button_code, self.current_state.buttons.x));
+                            ui.label(format!(
+                                "Shift Down: {} button {} (X={})",
+                                sd.device_name, sd.button_code, self.current_state.buttons.x
+                            ));
                         }
                         for g in &config.gears {
                             let label = match g.gear {
@@ -584,10 +794,8 @@ impl RoWheelApp {
                                 .input_reader
                                 .as_ref()
                                 .and_then(|r| {
-                                    r.state().get_button(
-                                        &g.button.device_id,
-                                        g.button.button_code,
-                                    )
+                                    r.state()
+                                        .get_button(&g.button.device_id, g.button.button_code)
                                 })
                                 .unwrap_or(false);
                             ui.label(format!(
@@ -602,19 +810,24 @@ impl RoWheelApp {
                 }
 
                 if let Some(ref reader) = self.input_reader {
-                    ui.collapsing("Connected Devices", |ui| {
+                    ui.collapsing("อุปกรณ์ที่ต่ออยู่", |ui| {
                         for (id, device) in reader.devices() {
-                            ui.label(format!("{}: {} (FF: {})",
-                                id, device.name, device.has_force_feedback));
+                            ui.label(format!(
+                                "{}: {} (FF: {})",
+                                id, device.name, device.has_force_feedback
+                            ));
                         }
                     });
 
-                    ui.collapsing("Raw Button States", |ui| {
+                    ui.collapsing("สถานะปุ่มดิบ", |ui| {
                         let state = reader.state();
                         for (device_id, buttons) in &state.buttons {
                             for (code, pressed) in buttons {
                                 if *pressed {
-                                    ui.label(format!("Device {} Button {}: PRESSED", device_id, code));
+                                    ui.label(format!(
+                                        "Device {} Button {}: PRESSED",
+                                        device_id, code
+                                    ));
                                 }
                             }
                         }
@@ -627,7 +840,6 @@ impl RoWheelApp {
 
 impl eframe::App for RoWheelApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        
         self.process_inputs();
         ctx.request_repaint();
 

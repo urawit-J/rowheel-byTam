@@ -12,8 +12,12 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([600.0, 500.0])
-            .with_min_inner_size([400.0, 300.0])
+            // Tall enough for a whole calibration step without scrolling:
+            // heading, progress, instructions, the wheel photo, the detected
+            // box and the step controls. Smaller still works -- the controls
+            // have a panel of their own and the rest scrolls.
+            .with_inner_size([700.0, 820.0])
+            .with_min_inner_size([400.0, 320.0])
             .with_title("RoWheel"),
         ..Default::default()
     };

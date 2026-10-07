@@ -204,10 +204,13 @@ pub struct WheelConfig {
     /// Booth menu cancel / back (wheel circle).
     #[serde(default)]
     pub menu_cancel: Option<ButtonBinding>,
-    /// Parking aid overlay, game key `T` (wheel triangle). It used to be L2,
-    /// until the mirror camera claimed that button.
-    #[serde(default)]
-    pub parking_aid: Option<ButtonBinding>,
+    /// Read, never written. The booth does not use the parking aid and the
+    /// wizard no longer asks for it, but L2 was once recorded under this name
+    /// and `migrate` still has to find it there to move it to the mirror
+    /// camera. Dropping the field outright would quietly cost those configs
+    /// their L2 binding.
+    #[serde(default, rename = "parking_aid", skip_serializing)]
+    legacy_parking_aid: Option<ButtonBinding>,
     /// Transmission mode toggle (game key `M`).
     pub gear_mode: Option<ButtonBinding>,
     pub force_feedback_device: Option<String>,
@@ -231,7 +234,7 @@ impl Default for WheelConfig {
             mirror_camera: None,
             menu_confirm: None,
             menu_cancel: None,
-            parking_aid: None,
+            legacy_parking_aid: None,
             gear_mode: None,
             force_feedback_device: None,
         }
@@ -270,7 +273,7 @@ impl WheelConfig {
     fn migrate(&mut self) {
         if self.schema < 1 {
             if self.mirror_camera.is_none() {
-                self.mirror_camera = self.parking_aid.take();
+                self.mirror_camera = self.legacy_parking_aid.take();
             }
             log::info!("Migrated config to schema 1: L2 moved from parking aid to mirror camera");
         }
@@ -343,21 +346,41 @@ mod tests {
         config.migrate();
 
         assert_eq!(config.mirror_camera.map(|b| b.button_code), Some(7));
-        assert!(config.parking_aid.is_none(), "the triangle button is still to be calibrated");
+        assert!(
+            config.legacy_parking_aid.is_none(),
+            "the old binding is consumed, not left to migrate again"
+        );
         assert_eq!(config.schema, CONFIG_SCHEMA);
     }
 
-    /// Migration must not fire twice and steal a freshly-bound triangle button.
+    /// Migration must not fire twice and overwrite a mirror camera that was
+    /// bound on purpose.
     #[test]
     fn a_current_config_is_left_alone() {
         let mut config = WheelConfig {
             mirror_camera: Some(button(7)),
-            parking_aid: Some(button(3)),
+            legacy_parking_aid: Some(button(3)),
             ..Default::default()
         };
         config.migrate();
 
         assert_eq!(config.mirror_camera.map(|b| b.button_code), Some(7));
-        assert_eq!(config.parking_aid.map(|b| b.button_code), Some(3));
+    }
+
+    /// The parking aid is gone from the wizard, so nothing should write the key
+    /// back out and leave a binding for a control that no longer exists.
+    #[test]
+    fn a_saved_config_no_longer_carries_the_parking_aid() {
+        let config = WheelConfig {
+            legacy_parking_aid: Some(button(3)),
+            ..Default::default()
+        };
+        let written = serde_json::to_string(&config).expect("config serialises");
+
+        assert!(
+            !written.contains("parking_aid"),
+            "the retired key was written back: {}",
+            written
+        );
     }
 }

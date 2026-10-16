@@ -271,8 +271,10 @@ impl RoWheelApp {
                     }
                 }
 
-                if let Some(ref parking_aid) = config.parking_aid {
-                    if let Some(pressed) = state.get_button(&parking_aid.device_id, parking_aid.button_code) {
+                if let Some(ref mirror_camera) = config.mirror_camera {
+                    if let Some(pressed) =
+                        state.get_button(&mirror_camera.device_id, mirror_camera.button_code)
+                    {
                         xbox_state.buttons.dpad_right = pressed;
                     }
                 }
@@ -280,6 +282,26 @@ impl RoWheelApp {
                 if let Some(ref gear_mode) = config.gear_mode {
                     if let Some(pressed) = state.get_button(&gear_mode.device_id, gear_mode.button_code) {
                         xbox_state.buttons.dpad_up = pressed;
+                    }
+                }
+
+                // The post-race board draws these two as the wheel's cross and circle, and
+                // the game listens for ButtonA / ButtonB. Note ButtonA is also Roblox's own
+                // jump: the game clamps it while the board is up, because jumping would put
+                // the driver out of the car.
+                if let Some(ref menu_confirm) = config.menu_confirm {
+                    if let Some(pressed) =
+                        state.get_button(&menu_confirm.device_id, menu_confirm.button_code)
+                    {
+                        xbox_state.buttons.a = pressed;
+                    }
+                }
+
+                if let Some(ref menu_cancel) = config.menu_cancel {
+                    if let Some(pressed) =
+                        state.get_button(&menu_cancel.device_id, menu_cancel.button_code)
+                    {
+                        xbox_state.buttons.b = pressed;
                     }
                 }
 

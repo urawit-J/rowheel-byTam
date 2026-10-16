@@ -125,17 +125,30 @@ pub struct WheelConfig {
     /// axis stays at rest and the game ignores it.
     #[serde(default)]
     pub gears: Vec<GearBinding>,
-    /// Camera toggle (game key `V`).
+    // Each of these is written to a fixed button on the virtual Xbox pad (see `app.rs`),
+    // and the game binds that same button. The KeyCode in each comment is what Roblox
+    // actually receives; Isuzu Challenge keeps the matching table in
+    // `chang-circuit/shared/Modules/BoothWheelHints.luau`. Changing a pad button here
+    // means changing it there too, or the on-screen hint stops matching the wheel.
+    /// Driver camera / view toggle. Wheel R3 -> `DPadDown`.
     #[serde(default)]
     pub camera: Option<ButtonBinding>,
-    /// Recovery / return to checkpoint (game key `R`).
+    /// Recovery / return to checkpoint. Wheel L3 -> `DPadLeft`.
     #[serde(default)]
     pub recovery: Option<ButtonBinding>,
-    /// Parking aid overlay (game key `T`).
+    /// Look back over the shoulder, held. Wheel L2 -> `DPadRight`.
+    /// Was `parking_aid`; the alias keeps an already-calibrated config readable.
+    #[serde(default, alias = "parking_aid")]
+    pub mirror_camera: Option<ButtonBinding>,
+    /// Transmission mode toggle (Auto / Hybrid / Manual). Wheel R2 -> `DPadUp`.
     #[serde(default)]
-    pub parking_aid: Option<ButtonBinding>,
-    /// Transmission mode toggle (game key `M`).
     pub gear_mode: Option<ButtonBinding>,
+    /// Confirm: play again on the post-race board. Wheel cross -> `ButtonA`.
+    #[serde(default)]
+    pub menu_confirm: Option<ButtonBinding>,
+    /// Back: wait and race the next booth instead. Wheel circle -> `ButtonB`.
+    #[serde(default)]
+    pub menu_cancel: Option<ButtonBinding>,
     pub force_feedback_device: Option<String>,
 }
 
@@ -153,8 +166,10 @@ impl Default for WheelConfig {
             gears: Vec::new(),
             camera: None,
             recovery: None,
-            parking_aid: None,
+            mirror_camera: None,
             gear_mode: None,
+            menu_confirm: None,
+            menu_cancel: None,
             force_feedback_device: None,
         }
     }

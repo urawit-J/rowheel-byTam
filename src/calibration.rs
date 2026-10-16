@@ -19,13 +19,16 @@ pub enum CalibrationStep {
     Gear(i8),
     Camera,
     Recovery,
-    ParkingAid,
+    MirrorCamera,
     GearMode,
+    /// Cross and circle: the two choices on the post-race board.
+    MenuConfirm,
+    MenuCancel,
     Complete,
 }
 
 impl CalibrationStep {
-    pub const TOTAL_STEPS: usize = 24;
+    pub const TOTAL_STEPS: usize = 26;
 
     pub fn index(&self) -> usize {
         match self {
@@ -46,9 +49,11 @@ impl CalibrationStep {
             Self::Gear(g) => 10 + (*g as usize),
             Self::Camera => 19,
             Self::Recovery => 20,
-            Self::ParkingAid => 21,
+            Self::MirrorCamera => 21,
             Self::GearMode => 22,
-            Self::Complete => 23,
+            Self::MenuConfirm => 23,
+            Self::MenuCancel => 24,
+            Self::Complete => 25,
         }
     }
 
@@ -63,10 +68,12 @@ impl CalibrationStep {
             Self::ShiftDown => "Shift Down".to_string(),
             Self::Gear(GEAR_REVERSE) => "Shifter - Reverse".to_string(),
             Self::Gear(g) => format!("Shifter - Gear {}", g),
-            Self::Camera => "Camera".to_string(),
+            Self::Camera => "Driver View".to_string(),
             Self::Recovery => "Recovery".to_string(),
-            Self::ParkingAid => "Parking Aid".to_string(),
+            Self::MirrorCamera => "Look Back".to_string(),
             Self::GearMode => "Transmission Mode".to_string(),
+            Self::MenuConfirm => "Play Again".to_string(),
+            Self::MenuCancel => "Race Next Booth".to_string(),
             Self::Complete => "Complete".to_string(),
         }
     }
@@ -105,11 +112,19 @@ impl CalibrationStep {
                 "Engage GEAR {} on the H-shifter, then continue.\n(Skip any gate your shifter does not have)",
                 g
             ),
-            Self::Camera => "Press the CAMERA button (wheel R3), then continue".to_string(),
+            Self::Camera => "Press the DRIVER VIEW button (wheel R3), then continue".to_string(),
             Self::Recovery => "Press the RECOVERY button (wheel L3), then continue".to_string(),
-            Self::ParkingAid => "Press the PARKING AID button (wheel L2), then continue".to_string(),
+            Self::MirrorCamera => {
+                "Press the LOOK BACK button (wheel L2), then continue".to_string()
+            }
             Self::GearMode => {
                 "Press the TRANSMISSION MODE button (wheel R2), then continue".to_string()
+            }
+            Self::MenuConfirm => {
+                "Press the CONFIRM button (wheel cross), then continue".to_string()
+            }
+            Self::MenuCancel => {
+                "Press the BACK button (wheel circle), then continue".to_string()
             }
             Self::Complete => "Successfully calibrated".to_string(),
         }
@@ -139,9 +154,11 @@ impl CalibrationStep {
             Self::Gear(g) if *g >= GEAR_MAX => Self::Gear(GEAR_REVERSE),
             Self::Gear(g) => Self::Gear(g + 1),
             Self::Camera => Self::Recovery,
-            Self::Recovery => Self::ParkingAid,
-            Self::ParkingAid => Self::GearMode,
-            Self::GearMode => Self::Complete,
+            Self::Recovery => Self::MirrorCamera,
+            Self::MirrorCamera => Self::GearMode,
+            Self::GearMode => Self::MenuConfirm,
+            Self::MenuConfirm => Self::MenuCancel,
+            Self::MenuCancel => Self::Complete,
             Self::Complete => Self::Complete,
         }
     }
@@ -433,9 +450,9 @@ impl CalibrationWizard {
                     });
                 }
             }
-            CalibrationStep::ParkingAid => {
+            CalibrationStep::MirrorCamera => {
                 if let Some((device_id, device_name, button_code)) = self.captured_button.take() {
-                    self.config.parking_aid = Some(ButtonBinding {
+                    self.config.mirror_camera = Some(ButtonBinding {
                         device_id,
                         device_name,
                         button_code,
@@ -445,6 +462,24 @@ impl CalibrationWizard {
             CalibrationStep::GearMode => {
                 if let Some((device_id, device_name, button_code)) = self.captured_button.take() {
                     self.config.gear_mode = Some(ButtonBinding {
+                        device_id,
+                        device_name,
+                        button_code,
+                    });
+                }
+            }
+            CalibrationStep::MenuConfirm => {
+                if let Some((device_id, device_name, button_code)) = self.captured_button.take() {
+                    self.config.menu_confirm = Some(ButtonBinding {
+                        device_id,
+                        device_name,
+                        button_code,
+                    });
+                }
+            }
+            CalibrationStep::MenuCancel => {
+                if let Some((device_id, device_name, button_code)) = self.captured_button.take() {
+                    self.config.menu_cancel = Some(ButtonBinding {
                         device_id,
                         device_name,
                         button_code,
@@ -521,8 +556,10 @@ impl CalibrationWizard {
                 | CalibrationStep::Gear(_)
                 | CalibrationStep::Camera
                 | CalibrationStep::Recovery
-                | CalibrationStep::ParkingAid
+                | CalibrationStep::MirrorCamera
                 | CalibrationStep::GearMode
+                | CalibrationStep::MenuConfirm
+                | CalibrationStep::MenuCancel
         )
     }
 }
@@ -544,6 +581,28 @@ mod tests {
             step = next;
         }
         steps
+    }
+
+    /// The game binds a fixed pad button per action, so every one of them has to be
+    /// bindable here or the wheel simply will not answer that control. The two menu
+    /// steps are the newest and the easiest to drop when the step list is edited.
+    #[test]
+    fn wizard_offers_every_button_the_game_listens_for() {
+        let steps = walk();
+        for want in [
+            CalibrationStep::Camera,
+            CalibrationStep::MirrorCamera,
+            CalibrationStep::GearMode,
+            CalibrationStep::MenuConfirm,
+            CalibrationStep::MenuCancel,
+        ] {
+            assert!(steps.contains(&want), "{:?} missing from the wizard", want);
+            assert!(
+                !want.instructions().is_empty() && !want.title().is_empty(),
+                "{:?} has no instructions or title to show the operator",
+                want
+            );
+        }
     }
 
     #[test]

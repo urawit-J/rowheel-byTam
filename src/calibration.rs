@@ -28,7 +28,12 @@ pub enum CalibrationStep {
 }
 
 impl CalibrationStep {
-    pub const TOTAL_STEPS: usize = 26;
+    // Spartan cabinets drive an automatic on the paddles, so the wizard walks
+    // the wheel, the two pedals and the two paddles only. The clutch, gate and
+    // IC booth-button steps below are kept compiled -- they are simply no longer
+    // reachable from `Welcome` -- so this branch can be merged back or
+    // re-expanded without rebuilding the capture logic.
+    pub const TOTAL_STEPS: usize = 10;
 
     pub fn index(&self) -> usize {
         match self {
@@ -39,21 +44,24 @@ impl CalibrationStep {
             Self::ThrottleReleased => 4,
             Self::BrakePressed => 5,
             Self::BrakeReleased => 6,
-            Self::ClutchPressed => 7,
-            Self::ClutchReleased => 8,
-            Self::ShiftUp => 9,
-            Self::ShiftDown => 10,
+            Self::ShiftUp => 7,
+            Self::ShiftDown => 8,
+            Self::Complete => 9,
+            // Off the walked path, so these never reach the progress counter.
+            // They stay numbered past `Complete` and clear of each other so the
+            // uniqueness test still means something if a step is wired back in.
+            Self::ClutchPressed => 10,
+            Self::ClutchReleased => 11,
             // Reverse is asked last, so the forward gates establish which device
             // the shifter is before the hardest gate to engage comes up.
-            Self::Gear(GEAR_REVERSE) => 18,
-            Self::Gear(g) => 10 + (*g as usize),
-            Self::Camera => 19,
-            Self::Recovery => 20,
-            Self::MirrorCamera => 21,
-            Self::GearMode => 22,
-            Self::MenuConfirm => 23,
-            Self::MenuCancel => 24,
-            Self::Complete => 25,
+            Self::Gear(GEAR_REVERSE) => 19,
+            Self::Gear(g) => 11 + (*g as usize),
+            Self::Camera => 20,
+            Self::Recovery => 21,
+            Self::MirrorCamera => 22,
+            Self::GearMode => 23,
+            Self::MenuConfirm => 24,
+            Self::MenuCancel => 25,
         }
     }
 
@@ -80,7 +88,7 @@ impl CalibrationStep {
 
     pub fn instructions(&self) -> String {
         match self {
-            Self::Welcome => "Make sure your wheel, pedals and shifter are connected".to_string(),
+            Self::Welcome => "Make sure your wheel and pedals are connected".to_string(),
             Self::SteeringLeft => {
                 "Turn the steering wheel all the way to the LEFT, then continue".to_string()
             }
@@ -145,11 +153,13 @@ impl CalibrationStep {
             Self::ThrottlePressed => Self::ThrottleReleased,
             Self::ThrottleReleased => Self::BrakePressed,
             Self::BrakePressed => Self::BrakeReleased,
-            Self::BrakeReleased => Self::ClutchPressed,
+            // Spartan: straight from the brake to the paddles, and done after
+            // them. The clutch and the gates have no hardware on these cabinets.
+            Self::BrakeReleased => Self::ShiftUp,
             Self::ClutchPressed => Self::ClutchReleased,
             Self::ClutchReleased => Self::ShiftUp,
             Self::ShiftUp => Self::ShiftDown,
-            Self::ShiftDown => Self::Gear(1),
+            Self::ShiftDown => Self::Complete,
             Self::Gear(GEAR_REVERSE) => Self::Camera,
             Self::Gear(g) if *g >= GEAR_MAX => Self::Gear(GEAR_REVERSE),
             Self::Gear(g) => Self::Gear(g + 1),
@@ -583,57 +593,66 @@ mod tests {
         steps
     }
 
-    /// The game binds a fixed pad button per action, so every one of them has to be
-    /// bindable here or the wheel simply will not answer that control. The two menu
-    /// steps are the newest and the easiest to drop when the step list is edited.
+    /// Spartan cabinets have a wheel, two pedals and two paddles. Anything else in
+    /// the walk is a step the operator has no hardware to answer and has to click
+    /// past; anything missing is a control the wheel will not answer at all.
     #[test]
-    fn wizard_offers_every_button_the_game_listens_for() {
-        let steps = walk();
-        for want in [
-            CalibrationStep::Camera,
-            CalibrationStep::MirrorCamera,
-            CalibrationStep::GearMode,
-            CalibrationStep::MenuConfirm,
-            CalibrationStep::MenuCancel,
-        ] {
-            assert!(steps.contains(&want), "{:?} missing from the wizard", want);
-            assert!(
-                !want.instructions().is_empty() && !want.title().is_empty(),
-                "{:?} has no instructions or title to show the operator",
-                want
-            );
-        }
-    }
-
-    #[test]
-    fn wizard_offers_every_gate_including_reverse() {
-        let titles: Vec<String> = walk().iter().map(|s| s.title()).collect();
-        assert!(
-            titles.contains(&"Shifter - Reverse".to_string()),
-            "reverse gate missing from the wizard: {:?}",
-            titles
+    fn the_wizard_asks_for_the_four_spartan_controls_and_nothing_else() {
+        assert_eq!(
+            walk(),
+            vec![
+                CalibrationStep::Welcome,
+                CalibrationStep::SteeringLeft,
+                CalibrationStep::SteeringRight,
+                CalibrationStep::ThrottlePressed,
+                CalibrationStep::ThrottleReleased,
+                CalibrationStep::BrakePressed,
+                CalibrationStep::BrakeReleased,
+                CalibrationStep::ShiftUp,
+                CalibrationStep::ShiftDown,
+                CalibrationStep::Complete,
+            ]
         );
-        for gear in 1..=GEAR_MAX {
-            let want = format!("Shifter - Gear {}", gear);
-            assert!(titles.contains(&want), "{} missing: {:?}", want, titles);
-        }
     }
 
-    /// Reverse is the gate most likely to report nothing, so it must be asked
-    /// after the forward gates have established which device the shifter is.
+    /// The wizard no longer visits the clutch, the gates or the booth buttons, so
+    /// it cannot clear them either. A config left behind by an IC build would keep
+    /// driving the dpad, A/B and R3 on a cabinet that has none of those controls.
     #[test]
-    fn reverse_is_the_last_gate() {
-        let steps = walk();
-        let reverse = steps
-            .iter()
-            .position(|s| *s == CalibrationStep::Gear(GEAR_REVERSE))
-            .expect("reverse step");
-        let top = steps
-            .iter()
-            .position(|s| *s == CalibrationStep::Gear(GEAR_MAX))
-            .expect("top gear step");
-        assert!(reverse > top, "reverse must come after gear {}", GEAR_MAX);
-        assert_eq!(steps[reverse + 1], CalibrationStep::Camera);
+    fn loading_an_ic_config_drops_everything_outside_the_four_controls() {
+        let mut config = WheelConfig::default();
+        let binding = ButtonBinding {
+            device_id: "wheel".to_string(),
+            device_name: "wheel".to_string(),
+            button_code: 3,
+        };
+        config.clutch = Some(AxisBinding {
+            device_id: "pedals".to_string(),
+            device_name: "pedals".to_string(),
+            axis_code: 2,
+            min_value: 0.0,
+            max_value: 1.0,
+            inverted: false,
+        });
+        config.set_gear(1, binding.clone());
+        config.set_gear(GEAR_REVERSE, binding.clone());
+        config.camera = Some(binding.clone());
+        config.recovery = Some(binding.clone());
+        config.mirror_camera = Some(binding.clone());
+        config.gear_mode = Some(binding.clone());
+        config.menu_confirm = Some(binding.clone());
+        config.menu_cancel = Some(binding.clone());
+
+        config.keep_spartan_bindings_only();
+
+        assert!(config.clutch.is_none(), "clutch survived");
+        assert!(config.gears.is_empty(), "gates survived: {:?}", config.gears);
+        assert!(config.camera.is_none(), "camera survived");
+        assert!(config.recovery.is_none(), "recovery survived");
+        assert!(config.mirror_camera.is_none(), "mirror camera survived");
+        assert!(config.gear_mode.is_none(), "gear mode survived");
+        assert!(config.menu_confirm.is_none(), "menu confirm survived");
+        assert!(config.menu_cancel.is_none(), "menu cancel survived");
     }
 
     fn button(device: &str, code: u32) -> InputEvent {

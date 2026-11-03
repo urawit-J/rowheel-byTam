@@ -180,8 +180,9 @@ impl WheelConfig {
         let path = Self::config_path();
         if path.exists() {
             match std::fs::read_to_string(&path) {
-                Ok(contents) => match serde_json::from_str(&contents) {
-                    Ok(config) => {
+                Ok(contents) => match serde_json::from_str::<Self>(&contents) {
+                    Ok(mut config) => {
+                        config.keep_spartan_bindings_only();
                         log::info!("Loaded config from {:?}", path);
                         return Some(config);
                     }
@@ -195,6 +196,21 @@ impl WheelConfig {
             }
         }
         None
+    }
+
+    /// Spartan cabinets have four controls. An IC config left next to the exe
+    /// would otherwise keep driving the dpad, A/B and R3 that this event's game
+    /// never asks for, because the wizard no longer visits those steps to clear
+    /// them and `CalibrationWizard::new` starts from whatever was loaded.
+    pub(crate) fn keep_spartan_bindings_only(&mut self) {
+        self.clutch = None;
+        self.gears.clear();
+        self.camera = None;
+        self.recovery = None;
+        self.mirror_camera = None;
+        self.gear_mode = None;
+        self.menu_confirm = None;
+        self.menu_cancel = None;
     }
 
     pub fn save(&self) -> anyhow::Result<()> {

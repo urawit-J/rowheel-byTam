@@ -481,54 +481,13 @@ impl RoWheelApp {
                         egui::RichText::new(text).color(color)
                     };
                     let b = &self.current_state.buttons;
+                    // The paddles are the only buttons a Spartan cabinet has. The
+                    // dpad, clutch and shifter readouts would sit dark and at rest
+                    // all day, so they are left out of this branch's screen.
                     ui.horizontal(|ui| {
                         ui.label(lamp(b.y, "Y Shift Up"));
                         ui.label(lamp(b.x, "X Shift Down"));
                     });
-                    ui.horizontal(|ui| {
-                        ui.label(lamp(b.dpad_up, "Up Trans"));
-                        ui.label(lamp(b.dpad_down, "Down Camera"));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(lamp(b.dpad_left, "Left Recovery"));
-                        ui.label(lamp(b.dpad_right, "Right Parking"));
-                    });
-                });
-
-                columns[1].add_space(10.0);
-
-                columns[1].group(|ui| {
-                    ui.label("Clutch (R3)");
-                    ui.add(
-                        egui::ProgressBar::new(self.clutch_travel).text(if self.clutch_engaged {
-                            "Clutch IN"
-                        } else {
-                            "Clutch out"
-                        }),
-                    );
-                });
-
-                columns[1].add_space(10.0);
-
-                columns[1].group(|ui| {
-                    ui.label("Shifter (Right Stick)");
-                    let gear = match self.current_gear {
-                        crate::config::GEAR_REVERSE => "R".to_string(),
-                        crate::config::GEAR_NEUTRAL => "N".to_string(),
-                        g => g.to_string(),
-                    };
-                    ui.label(
-                        egui::RichText::new(format!("Gear {}", gear))
-                            .size(20.0)
-                            .strong(),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "x={:.2} y={:.2}",
-                            self.current_state.right_stick_x, self.current_state.right_stick_y
-                        ))
-                        .monospace(),
-                    );
                 });
             });
 
